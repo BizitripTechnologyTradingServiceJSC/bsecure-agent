@@ -1,0 +1,20 @@
+[Unit]
+Description=Firewall platform agent
+After=network-online.target
+
+[Service]
+EnvironmentFile=/etc/fwagent.env
+ExecStart=/usr/local/bin/fwagent
+Restart=always
+User=root
+# Agent only needs nft; drop everything else.
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/fwagent
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
