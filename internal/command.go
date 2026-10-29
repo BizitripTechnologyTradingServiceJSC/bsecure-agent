@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"regexp"
 	"time"
 )
 
@@ -21,8 +22,14 @@ type Command struct {
 }
 
 type Params struct {
-	IP         string `json:"ip"`
+	IP         string `json:"ip,omitempty"`
 	TTLSeconds int    `json:"ttlSeconds,omitempty"`
+	// set_config / confirm_config
+	Software   string `json:"software,omitempty"`
+	Key        string `json:"key,omitempty"`
+	Value      string `json:"value,omitempty"`
+	ConfirmSec int    `json:"confirmSec,omitempty"`
+	ChangeID   string `json:"changeId,omitempty"`
 }
 
 const (
@@ -31,7 +38,9 @@ const (
 )
 
 // Fixed action set. There is no shell passthrough: anything else is rejected.
-var allowedActions = map[string]bool{"block_ip": true, "unblock_ip": true}
+var allowedActions = map[string]bool{"block_ip": true, "unblock_ip": true, "set_config": true, "confirm_config": true}
+
+var changeIDRe = regexp.MustCompile(`^[0-9a-f]{24}$`)
 
 // Verify checks signature, server binding, expiry, replay, action allowlist and parameters.
 func Verify(pub ed25519.PublicKey, serverID, payload, sigB64 string, now time.Time, seen func(nonce string) bool, guard *Guard) (*Command, error) {
@@ -56,15 +65,34 @@ func Verify(pub ed25519.PublicKey, serverID, payload, sigB64 string, now time.Ti
 	if !allowedActions[c.Action] {
 		return nil, fmt.Errorf("action %q not allowed", c.Action)
 	}
-	ip, err := netip.ParseAddr(c.Params.IP)
-	if err != nil {
-		return nil, errors.New("invalid ip")
-	}
-	if err := guard.CheckIP(ip.Unmap()); err != nil {
-		return nil, err
-	}
-	if c.Action == "block_ip" && (c.Params.TTLSeconds < MinBlockTTL || c.Params.TTLSeconds > MaxBlockTTL) {
-		return nil, errors.New("ttlSeconds out of range")
+	switch c.Action {
+	case "block_ip", "unblock_ip":
+		ip, err := netip.ParseAddr(c.Params.IP)
+		if err != nil {
+			return nil, errors.New("invalid ip")
+		}
+		if err := guard.CheckIP(ip.Unmap()); err != nil {
+			return nil, err
+		}
+		if c.Action == "block_ip" && (c.Params.TTLSeconds < MinBlockTTL || c.Params.TTLSeconds > MaxBlockTTL) {
+			return nil, errors.New("ttlSeconds out of range")
+		}
+	case "set_config":
+		key, err := ValidateSetting(c.Params.Software, c.Params.Key, c.Params.Value)
+		if err != nil {
+			return nil, err
+		}
+		c.Params.Key = key
+		if c.Params.ConfirmSec == 0 {
+			c.Params.ConfirmSec = 120
+		}
+		if c.Params.ConfirmSec < 30 || c.Params.ConfirmSec > 900 {
+			return nil, errors.New("confirmSec out of range 30..900")
+		}
+	case "confirm_config":
+		if !changeIDRe.MatchString(c.Params.ChangeID) {
+			return nil, errors.New("invalid changeId")
+		}
 	}
 	return &c, nil
 }

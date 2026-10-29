@@ -29,6 +29,7 @@ type Config struct {
 	Syslog      string
 	DryRun      bool
 	Allowlist   []string
+	AllowConfig bool   // opt-in: allow signed set_config commands to edit sshd/nginx/tinyproxy config
 	PanelPubKey string // base64 raw ed25519; pinned out-of-band, overrides what enroll returns
 }
 
@@ -42,6 +43,7 @@ type Agent struct {
 	cfg    Config
 	http   *http.Client
 	fw     Firewall
+	cm     *ConfigManager
 	guard  *Guard
 	st     state
 	pub    ed25519.PublicKey
@@ -56,7 +58,7 @@ func New(cfg Config, fw Firewall) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{cfg: cfg, fw: fw, guard: g, http: &http.Client{Timeout: 15 * time.Second}, seen: map[string]time.Time{}, tails: sources(cfg)}, nil
+	return &Agent{cfg: cfg, fw: fw, cm: NewConfigManager(cfg.StateDir), guard: g, http: &http.Client{Timeout: 15 * time.Second}, seen: map[string]time.Time{}, tails: sources(cfg)}, nil
 }
 
 func (a *Agent) do(method, path string, body, out any) error {
@@ -118,7 +120,7 @@ func (a *Agent) loadKey() error {
 
 func (a *Agent) Heartbeat() error {
 	return a.do("POST", "/agent/heartbeat", map[string]any{
-		"agentVersion": Version, "os": runtime.GOOS + "/" + runtime.GOARCH, "dryRun": a.cfg.DryRun,
+		"agentVersion": Version, "os": runtime.GOOS + "/" + runtime.GOARCH, "dryRun": a.cfg.DryRun, "allowConfig": a.cfg.AllowConfig,
 		"firewall": map[string]any{"backend": a.fw.Backend(), "ready": true, "blocked": a.fw.Count()},
 	}, nil)
 }
@@ -221,13 +223,29 @@ func (a *Agent) Execute(payload, sig string) (string, string) {
 	if err != nil {
 		return "rejected", err.Error()
 	}
-	ip := netip.MustParseAddr(c.Params.IP).Unmap()
 	var out string
 	switch c.Action {
-	case "block_ip":
-		out, err = a.fw.Block(ip, c.Params.TTLSeconds)
-	case "unblock_ip":
-		out, err = a.fw.Unblock(ip)
+	case "block_ip", "unblock_ip":
+		ip := netip.MustParseAddr(c.Params.IP).Unmap()
+		if c.Action == "block_ip" {
+			out, err = a.fw.Block(ip, c.Params.TTLSeconds)
+		} else {
+			out, err = a.fw.Unblock(ip)
+		}
+	case "set_config":
+		if !a.cfg.AllowConfig {
+			return "rejected", "config changes are disabled on this agent (set ALLOW_CONFIG_CHANGES=true)"
+		}
+		return a.cm.Apply(c.ID, Change{c.Params.Software, c.Params.Key, c.Params.Value}, c.Params.ConfirmSec, a.cfg.DryRun)
+	case "confirm_config":
+		if !a.cfg.AllowConfig {
+			return "rejected", "config changes are disabled on this agent"
+		}
+		if !a.cm.Confirm(c.Params.ChangeID) {
+			return "failed", "no pending change with that id (already confirmed or reverted)"
+		}
+		a.report(c.Params.ChangeID, "confirmed", "confirmed by "+c.ID)
+		return "success", "change confirmed, auto-revert cancelled"
 	}
 	if err != nil {
 		return "failed", trunc(fmt.Sprintf("%s: %v", out, err))
@@ -236,6 +254,25 @@ func (a *Agent) Execute(payload, sig string) (string, string) {
 		return "dry_run", trunc(out)
 	}
 	return "success", trunc(out)
+}
+
+func (a *Agent) report(cmdID, status, out string) {
+	if err := a.do("POST", "/agent/commands/"+cmdID+"/result", map[string]string{"status": status, "output": out}, nil); err != nil {
+		log.Printf("report result: %v", err)
+	}
+}
+
+// RevertDue undoes applied config changes whose confirmation window expired.
+func (a *Agent) RevertDue() {
+	for _, p := range a.cm.Due() {
+		if err := a.cm.Revert(p); err != nil {
+			log.Printf("revert %s failed: %v", p.CmdID, err)
+			a.report(p.CmdID, "failed", trunc("auto-revert FAILED, manual action needed: "+err.Error()))
+			continue
+		}
+		log.Printf("reverted %s.%s (not confirmed in time)", p.Software, p.Key)
+		a.report(p.CmdID, "reverted", fmt.Sprintf("not confirmed in time; restored previous %s config", p.Software))
+	}
 }
 
 func trunc(s string) string {
@@ -251,6 +288,7 @@ func (a *Agent) Run() error {
 		return err
 	}
 	hb, ev, cm, inv := time.NewTicker(30*time.Second), time.NewTicker(10*time.Second), time.NewTicker(5*time.Second), time.NewTicker(5*time.Minute)
+	a.RevertDue() // changes left unconfirmed across an agent restart
 	_ = a.Heartbeat()
 	if err := a.SendInventory(); err != nil {
 		log.Printf("inventory: %v", err)
@@ -271,6 +309,7 @@ func (a *Agent) Run() error {
 				log.Printf("events: %v", err)
 			}
 		case <-cm.C:
+			a.RevertDue() // before polling: a revert must not wait on the network
 			if err := a.PollCommands(); err != nil {
 				log.Printf("commands: %v", err)
 			}

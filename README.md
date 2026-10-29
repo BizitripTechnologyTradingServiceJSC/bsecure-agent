@@ -17,7 +17,18 @@ ADMIN_ALLOWLIST=<IP quản trị, phân tách bằng dấu phẩy> ./fwagent
 - **Log** → events đã chuẩn hoá và che dữ liệu nhạy cảm: SSH (`AUTH_LOG`), nginx access (`NGINX_ACCESS_LOG`: dò quét như `/.env`, `wp-login.php`, path traversal, SQLi/XSS, và 401), syslog (`SYSLOG`: sudo thất bại, OOM kill, user mới, segfault). Query string và User-Agent bị bỏ.
 - Agent chỉ báo dữ kiện; việc chấm điểm nằm ở Control Panel. Agent **chưa sửa cấu hình phần mềm** nào.
 
-Biến môi trường: `PANEL_URL`, `ENROLL_TOKEN`, `PANEL_PUBKEY` (nên ghim), `AGENT_NAME`, `STATE_DIR` (/var/lib/fwagent), `AUTH_LOG` (/var/log/auth.log), `NGINX_ACCESS_LOG` (/var/log/nginx/access.log), `SYSLOG` (/var/log/syslog); để trống để tắt nguồn đó, `ADMIN_ALLOWLIST`, `DRY_RUN`.
+## Đổi cấu hình phần mềm (tắt mặc định)
+Bật bằng `ALLOW_CONFIG_CHANGES=true` (kèm `deploy/fwagent-config.conf` nếu chạy bằng systemd). Agent chỉ nhận lệnh `set_config` đã ký cho **danh mục cố định** (`internal/catalog.go`), chỉ theo hướng siết chặt:
+
+| Phần mềm | Thiết lập được đổi |
+|---|---|
+| sshd | `PermitRootLogin` (no/prohibit-password), `PasswordAuthentication no`, `PermitEmptyPasswords no`, `X11Forwarding no`, `MaxAuthTries` 2–6 |
+| nginx | `server_tokens off`, `ssl_protocols` (TLSv1.2 TLSv1.3 / TLSv1.3) |
+| tinyproxy | `Allow` (IP/CIDR, từ chối dải quá rộng như 0.0.0.0/0), `ConnectPort`, `Listen` |
+
+Quy trình mỗi lần đổi: kiểm tra khoá không bị khoá cửa (sshd cần có `authorized_keys`) → sao lưu → ghi file nguyên tử → `sshd -t` / `nginx -t` → reload → **kiểm tra giá trị hiệu lực** (`sshd -T`, đọc lại cấu hình nginx, tinyproxy còn chạy) → bất kỳ bước nào lỗi thì **khôi phục bản cũ** và reload lại. Nếu thành công, thay đổi ở trạng thái `pending_confirm` và **tự hoàn tác sau 30–900 giây (mặc định 120)** nếu không có lệnh `confirm_config` từ người dùng (kể cả khi agent khởi động lại giữa chừng). sshd ghi vào drop-in `00-bsecure.conf`, nginx sửa các dòng có sẵn (hoặc tạo `conf.d/00-bsecure.conf`), tinyproxy sửa file cấu hình. Mỗi phần mềm chỉ có 1 thay đổi chờ xác nhận tại một thời điểm. `DRY_RUN=true` chỉ trả về diff, không ghi gì.
+
+Biến môi trường: `PANEL_URL`, `ENROLL_TOKEN`, `PANEL_PUBKEY` (nên ghim), `AGENT_NAME`, `STATE_DIR` (/var/lib/fwagent), `AUTH_LOG` (/var/log/auth.log), `NGINX_ACCESS_LOG` (/var/log/nginx/access.log), `SYSLOG` (/var/log/syslog); để trống để tắt nguồn đó, `ADMIN_ALLOWLIST`, `DRY_RUN`, `ALLOW_CONFIG_CHANGES` (false).
 systemd: `deploy/fwagent.service`. Test: `go test ./...`
 
 Chưa chạy `nft` thật; thử trên máy lab có console trước khi đặt `DRY_RUN=false`.
