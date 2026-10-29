@@ -24,7 +24,9 @@ type Config struct {
 	Name        string
 	EnrollToken string
 	StateDir    string
-	LogFile     string
+	AuthLog     string
+	NginxLog    string
+	Syslog      string
 	DryRun      bool
 	Allowlist   []string
 	PanelPubKey string // base64 raw ed25519; pinned out-of-band, overrides what enroll returns
@@ -45,7 +47,7 @@ type Agent struct {
 	pub    ed25519.PublicKey
 	mu     sync.Mutex
 	seen   map[string]time.Time
-	tail   *Tail
+	tails  []*logSource
 	events []Event
 }
 
@@ -54,7 +56,7 @@ func New(cfg Config, fw Firewall) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{cfg: cfg, fw: fw, guard: g, http: &http.Client{Timeout: 15 * time.Second}, seen: map[string]time.Time{}, tail: &Tail{Path: cfg.LogFile}}, nil
+	return &Agent{cfg: cfg, fw: fw, guard: g, http: &http.Client{Timeout: 15 * time.Second}, seen: map[string]time.Time{}, tails: sources(cfg)}, nil
 }
 
 func (a *Agent) do(method, path string, body, out any) error {
@@ -121,20 +123,46 @@ func (a *Agent) Heartbeat() error {
 	}, nil)
 }
 
-// CollectEvents reads new log lines into the buffer.
-func (a *Agent) CollectEvents() {
-	if a.cfg.LogFile == "" {
-		return
-	}
-	lines, err := a.tail.Read(500)
-	if err != nil {
-		return
-	}
-	for _, l := range lines {
-		if e := ParseSSH(l, time.Now()); e != nil {
-			a.events = append(a.events, *e)
+type logSource struct {
+	tail  *Tail
+	parse Parser
+}
+
+func sources(cfg Config) []*logSource {
+	var out []*logSource
+	for _, s := range []struct {
+		path string
+		p    Parser
+	}{{cfg.AuthLog, ParseSSH}, {cfg.NginxLog, ParseNginxAccess}, {cfg.Syslog, ParseSyslog}} {
+		if s.path != "" {
+			out = append(out, &logSource{&Tail{Path: s.path}, s.p})
 		}
 	}
+	return out
+}
+
+// CollectEvents reads new log lines from every configured source into the buffer.
+func (a *Agent) CollectEvents() {
+	for _, src := range a.tails {
+		lines, err := src.tail.Read(500)
+		if err != nil {
+			continue
+		}
+		for _, l := range lines {
+			if e := src.parse(l, time.Now()); e != nil {
+				a.events = append(a.events, *e)
+			}
+		}
+	}
+	if len(a.events) > 5000 { // panel unreachable for a long time: keep the newest
+		a.events = a.events[len(a.events)-5000:]
+	}
+}
+
+// SendInventory reports ports, software versions and parsed settings (read-only facts).
+func (a *Agent) SendInventory() error {
+	c := &Collector{Run: ExecRunner}
+	return a.do("POST", "/agent/inventory", c.Collect(), nil)
 }
 
 func (a *Agent) FlushEvents() error {
@@ -222,13 +250,20 @@ func (a *Agent) Run() error {
 	if err := a.fw.Setup(a.guard.Allow); err != nil {
 		return err
 	}
-	hb, ev, cm := time.NewTicker(30*time.Second), time.NewTicker(10*time.Second), time.NewTicker(5*time.Second)
+	hb, ev, cm, inv := time.NewTicker(30*time.Second), time.NewTicker(10*time.Second), time.NewTicker(5*time.Second), time.NewTicker(5*time.Minute)
 	_ = a.Heartbeat()
+	if err := a.SendInventory(); err != nil {
+		log.Printf("inventory: %v", err)
+	}
 	for {
 		select {
 		case <-hb.C:
 			if err := a.Heartbeat(); err != nil {
 				log.Printf("heartbeat: %v", err)
+			}
+		case <-inv.C:
+			if err := a.SendInventory(); err != nil {
+				log.Printf("inventory: %v", err)
 			}
 		case <-ev.C:
 			a.CollectEvents()
