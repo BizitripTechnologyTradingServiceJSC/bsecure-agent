@@ -3,6 +3,7 @@ package agent
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -170,5 +171,30 @@ func TestReloadWithoutSystemd(t *testing.T) {
 	}
 	if !f.called("kill -HUP 4242") {
 		t.Fatalf("expected HUP to sshd master pid: %v", f.calls)
+	}
+}
+
+func TestEnrollRetriesUntilPanelIsUp(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) < 3 {
+			w.WriteHeader(503)
+			return
+		}
+		w.Write([]byte(`{"serverId":"s1","token":"t","panelPublicKey":"` + base64.StdEncoding.EncodeToString(make([]byte, 32)) + `"}`))
+	}))
+	defer srv.Close()
+	a := &Agent{cfg: Config{PanelURL: srv.URL, StateDir: t.TempDir()}, http: srv.Client()}
+	var slept []time.Duration
+	if err := a.EnrollWithRetry(func(d time.Duration) { slept = append(slept, d) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(slept) != 2 || slept[1] != 10*time.Second || a.st.ServerID != "s1" {
+		t.Fatalf("slept=%v st=%+v", slept, a.st)
+	}
+	// bad pinned key is a local config error: no retry loop
+	b := &Agent{cfg: Config{PanelURL: srv.URL, StateDir: t.TempDir(), PanelPubKey: "not-base64!"}, http: srv.Client()}
+	if err := b.EnrollWithRetry(func(time.Duration) { t.Fatal("should not retry") }); err == nil {
+		t.Fatal("expected error")
 	}
 }

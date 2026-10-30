@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -111,6 +113,25 @@ func (a *Agent) Enroll() error {
 		return err
 	}
 	return a.loadKey()
+}
+
+// EnrollWithRetry keeps trying while the panel is unreachable or refuses (e.g. waiting for an admin to reset
+// the enrollment), backing off 5s → 5min. Local configuration errors are returned immediately.
+func (a *Agent) EnrollWithRetry(sleep func(time.Duration)) error {
+	wait := 5 * time.Second
+	for {
+		err := a.Enroll()
+		var he *httpError
+		var ne net.Error
+		if err == nil || !(errors.As(err, &he) || errors.As(err, &ne) || strings.Contains(err.Error(), "connection refused")) {
+			return err
+		}
+		log.Printf("enroll failed, retrying in %s: %v", wait, err)
+		sleep(wait)
+		if wait *= 2; wait > 5*time.Minute {
+			wait = 5 * time.Minute
+		}
+	}
 }
 
 func (a *Agent) loadKey() error {

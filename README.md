@@ -1,21 +1,29 @@
 # bsecure-agent
 
-Agent Go (không phụ thuộc thư viện ngoài) chạy trên từng server: gửi heartbeat và log SSH lên Control Panel ([bsecure-cp](https://github.com/BizitripTechnologyTradingServiceJSC/bsecure-cp)), nhận lệnh đã ký và thực thi trên nftables.
+Agent Go (không phụ thuộc thư viện ngoài) chạy trên từng server: gửi heartbeat, inventory và log lên Control Panel ([bsecure-cp](https://github.com/BizitripTechnologyTradingServiceJSC/bsecure-cp)), nhận lệnh đã ký và thực thi trên nftables hoặc cấu hình phần mềm.
 
-- Chỉ gọi ra ngoài, không mở cổng.
-- Chỉ chạy `block_ip` / `unblock_ip`, không có shell. Dùng bảng riêng `inet fwctl`, block có timeout tự hết.
-- Mỗi lệnh phải có chữ ký Ed25519 hợp lệ, đúng server, chưa hết hạn, chưa dùng lại; IP trong `ADMIN_ALLOWLIST` và loopback/multicast luôn bị từ chối.
+- Chỉ gọi ra ngoài, không mở cổng. Kết nối tới panel bằng HTTPS, có mTLS (chứng chỉ client riêng cho mỗi server).
+- Chỉ chạy một tập hành động cố định (`block_ip`, `unblock_ip`, `set_config`, `confirm_config`), không có shell. Firewall dùng bảng riêng `inet fwctl`, block có timeout tự hết.
+- Mỗi lệnh phải có chữ ký Ed25519 hợp lệ, đúng server, chưa hết hạn, chưa dùng lại (nonce lưu xuống đĩa, không bị phát lại sau khi khởi động lại).
+- Không bao giờ chặn IP trong `ADMIN_ALLOWLIST`, loopback/multicast hay Cloudflare edge (danh sách có sẵn + danh sách panel gửi xuống qua heartbeat); gỡ chặn thì luôn được.
 - `DRY_RUN=true` mặc định.
 
 ```bash
 go build -o fwagent ./cmd/fwagent
-PANEL_URL=https://panel.example ENROLL_TOKEN=... PANEL_PUBKEY=<từ npm run keygen ở bsecure-cp> \
-ADMIN_ALLOWLIST=<IP quản trị, phân tách bằng dấu phẩy> ./fwagent
+PANEL_URL=https://panel.example:8443 ENROLL_TOKEN=... PANEL_PUBKEY=<từ npm run keygen ở bsecure-cp> \
+PANEL_CA_FILE=/etc/fwagent/ca.crt AGENT_CERT_FILE=/etc/fwagent/agent.crt AGENT_KEY_FILE=/etc/fwagent/agent.key \
+AGENT_NAME=web-01 ADMIN_ALLOWLIST=<IP quản trị, phân tách bằng dấu phẩy> ./fwagent
 ```
+Chứng chỉ tạo bằng `scripts/gen-certs.sh` trong bsecure-cp (CN phải trùng `AGENT_NAME`). `http://` bị từ chối trừ khi đặt `ALLOW_INSECURE_HTTP=true` (chỉ để thử cục bộ).
+
 ## Thu thập (chỉ đọc)
-- **Inventory** mỗi 5 phút → `/agent/inventory`: cổng đang nghe (từ `/proc/net/*`, kèm tiến trình), OS/kernel, và với **sshd / nginx / tinyproxy**: phiên bản, đang chạy hay không, các thiết lập bảo mật đã phân tích, hash cấu hình. Không gửi nguyên file cấu hình hay mật khẩu (BasicAuth chỉ báo "có/không").
-- **Log** → events đã chuẩn hoá và che dữ liệu nhạy cảm: SSH (`AUTH_LOG`), nginx access (`NGINX_ACCESS_LOG`: dò quét như `/.env`, `wp-login.php`, path traversal, SQLi/XSS, và 401), syslog (`SYSLOG`: sudo thất bại, OOM kill, user mới, segfault). Query string và User-Agent bị bỏ.
-- Agent chỉ báo dữ kiện; việc chấm điểm nằm ở Control Panel. Agent **chưa sửa cấu hình phần mềm** nào.
+- **Inventory** mỗi 5 phút: cổng đang nghe (từ `/proc/net/*`, kèm tiến trình), OS/kernel, và với **sshd / nginx / tinyproxy**: phiên bản, đang chạy hay không, các thiết lập bảo mật đã phân tích, hash cấu hình. Không gửi nguyên file cấu hình hay mật khẩu (BasicAuth chỉ báo "có/không").
+- **Log** → events đã chuẩn hoá và che dữ liệu nhạy cảm:
+  - SSH (`AUTH_LOG`): đếm **số lần thử**, không đếm số dòng log (một lần đăng nhập sai không còn bị tính 2 lần); bắt cả scanner chỉ dùng key (dòng `[preauth]`).
+  - nginx access (`NGINX_ACCESS_LOG`): dò quét như `/.env`, `wp-login.php`, path traversal, SQLi/XSS, và 401. Query string và User-Agent bị bỏ.
+  - syslog (`SYSLOG`): sudo thất bại, OOM kill, user mới, segfault.
+- Phát hiện xoay vòng log theo danh tính file (không chỉ theo kích thước).
+- Agent chỉ báo dữ kiện; việc chấm điểm nằm ở Control Panel.
 
 ## Đổi cấu hình phần mềm (tắt mặc định)
 Bật bằng `ALLOW_CONFIG_CHANGES=true` (kèm `deploy/fwagent-config.conf` nếu chạy bằng systemd). Agent chỉ nhận lệnh `set_config` đã ký cho **danh mục cố định** (`internal/catalog.go`), chỉ theo hướng siết chặt:
@@ -26,13 +34,27 @@ Bật bằng `ALLOW_CONFIG_CHANGES=true` (kèm `deploy/fwagent-config.conf` nế
 | nginx | `server_tokens off`, `ssl_protocols` (TLSv1.2 TLSv1.3 / TLSv1.3) |
 | tinyproxy | `Allow` (IP/CIDR, từ chối dải quá rộng như 0.0.0.0/0), `ConnectPort`, `Listen` |
 
-Quy trình mỗi lần đổi: kiểm tra khoá không bị khoá cửa (sshd cần có `authorized_keys`) → sao lưu → ghi file nguyên tử → `sshd -t` / `nginx -t` → reload → **kiểm tra giá trị hiệu lực** (`sshd -T`, đọc lại cấu hình nginx, tinyproxy còn chạy) → bất kỳ bước nào lỗi thì **khôi phục bản cũ** và reload lại. Nếu thành công, thay đổi ở trạng thái `pending_confirm` và **tự hoàn tác sau 30–900 giây (mặc định 120)** nếu không có lệnh `confirm_config` từ người dùng (kể cả khi agent khởi động lại giữa chừng). sshd ghi vào drop-in `00-bsecure.conf`, nginx sửa các dòng có sẵn (hoặc tạo `conf.d/00-bsecure.conf`), tinyproxy sửa file cấu hình. Mỗi phần mềm chỉ có 1 thay đổi chờ xác nhận tại một thời điểm. `DRY_RUN=true` chỉ trả về diff, không ghi gì.
+Quy trình mỗi lần đổi: kiểm tra không tự khoá cửa (sshd cần có `authorized_keys`) → sao lưu → ghi file nguyên tử → `sshd -t` / `nginx -t` → reload → **kiểm tra giá trị hiệu lực** (`sshd -T`, đọc lại cấu hình nginx, tinyproxy còn chạy) → bất kỳ bước nào lỗi thì **khôi phục bản cũ** và reload lại. Nếu thành công, thay đổi ở trạng thái `pending_confirm` và **tự hoàn tác sau 30–900 giây (mặc định 120)** nếu không có lệnh `confirm_config` (kể cả khi agent khởi động lại giữa chừng). Hoàn tác thất bại thì thử lại giãn dần 1 phút → 1 giờ và chỉ báo lỗi một lần.
 
-Biến môi trường: `PANEL_URL`, `ENROLL_TOKEN`, `PANEL_PUBKEY` (nên ghim), `AGENT_NAME`, `STATE_DIR` (/var/lib/fwagent), `AUTH_LOG` (/var/log/auth.log), `NGINX_ACCESS_LOG` (/var/log/nginx/access.log), `SYSLOG` (/var/log/syslog); để trống để tắt nguồn đó, `ADMIN_ALLOWLIST`, `DRY_RUN`, `ALLOW_CONFIG_CHANGES` (false).
-systemd: `deploy/fwagent.service`. Test: `go test ./...`
+Reload dùng `systemctl`; trên máy không có systemd (container, OpenRC) thì dùng `nginx -s reload`, HUP cho sshd và USR1 cho tinyproxy qua pid file.
 
-- Kết quả lệnh được lưu vào `STATE_DIR/outbox.json` khi panel không với tới được và gửi lại theo đúng thứ tự, nên panel không bỏ lỡ kết quả "đã tự hoàn tác".
-- Không bao giờ chặn IP Cloudflare edge hay IP trong `ADMIN_ALLOWLIST`; gỡ chặn thì luôn được.
+## Biến môi trường
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `PANEL_URL` | (bắt buộc) | `https://...` |
+| `PANEL_CA_FILE`, `AGENT_CERT_FILE`, `AGENT_KEY_FILE` | | mTLS: CA riêng (không dùng CA hệ thống) và chứng chỉ client |
+| `ENROLL_TOKEN`, `PANEL_PUBKEY` | | đăng ký lần đầu; nên ghim khoá công khai của panel |
+| `AGENT_NAME` | hostname | phải trùng CN của chứng chỉ |
+| `STATE_DIR` | `/var/lib/fwagent` | token, lệnh chờ xác nhận, outbox, nonce |
+| `AUTH_LOG`, `NGINX_ACCESS_LOG`, `SYSLOG` | `/var/log/...` | để trống để tắt nguồn đó |
+| `ADMIN_ALLOWLIST` | | IP/CIDR không bao giờ bị chặn |
+| `DRY_RUN` | `true` | |
+| `ALLOW_CONFIG_CHANGES` | `false` | |
+| `ALLOW_INSECURE_HTTP` | `false` | chỉ để thử |
+
+systemd: `deploy/fwagent.service`. Test: `go test ./...`; kiểm thử đầu cuối bằng Docker: `lab/e2e.sh` trong bsecure-cp.
+
+## Vận hành
+- Kết quả lệnh được lưu vào `STATE_DIR/outbox.json` khi panel không với tới được và gửi lại theo đúng thứ tự.
 - Mất `state.json` (cài lại máy) thì admin phải bấm **Reset enroll** trên panel trước khi agent đăng ký lại.
-
-Chưa chạy `nft` thật; thử trên máy lab có console trước khi đặt `DRY_RUN=false`.
+- Trước khi đặt `DRY_RUN=false` trên server thật: chạy lab, rồi canary trên một server ít quan trọng, luôn có đường vào console.
