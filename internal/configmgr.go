@@ -370,7 +370,7 @@ func (m *ConfigManager) verify(c Change) error {
 		if err != nil {
 			return fmt.Errorf("sshd -T failed: %s", trunc(out))
 		}
-		if got := ParseSSHD(out)[strings.ToLower(c.Key)]; fmt.Sprint(got) != strings.ToLower(c.Value) {
+		if got := ParseSSHD(out)[strings.ToLower(c.Key)]; sshValue(fmt.Sprint(got)) != sshValue(c.Value) {
 			return fmt.Errorf("effective %s is %v, not %s (overridden elsewhere?)", c.Key, got, c.Value)
 		}
 	case "nginx":
@@ -400,6 +400,15 @@ func (m *ConfigManager) verify(c Change) error {
 		return errors.New("tinyproxy is not running after restart")
 	}
 	return nil
+}
+
+// sshValue normalises sshd keyword aliases: `sshd -T` prints the legacy "without-password" for prohibit-password.
+func sshValue(v string) string {
+	v = strings.ToLower(v)
+	if v == "without-password" {
+		return "prohibit-password"
+	}
+	return v
 }
 
 func sortedFields(s string) string {

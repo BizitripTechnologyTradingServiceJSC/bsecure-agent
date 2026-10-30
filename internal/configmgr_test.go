@@ -254,3 +254,11 @@ func TestExecuteConfigFlow(t *testing.T) {
 		t.Fatal("second confirm must fail")
 	}
 }
+
+func TestVerifyAcceptsSSHDAliases(t *testing.T) {
+	m, f, _ := newMgr(t)
+	f.sshdT = func() string { return "permitrootlogin without-password\n" } // OpenSSH 9.x output
+	if st, out := m.Apply("aaaaaaaaaaaaaaaaaaaaaaaa", Change{"sshd", "PermitRootLogin", "prohibit-password"}, 60, false); st != "pending_confirm" {
+		t.Fatalf("%s %s", st, out)
+	}
+}
