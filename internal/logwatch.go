@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -135,7 +136,7 @@ func (t *Tail) Read(max int) ([]string, error) {
 			break // partial last line stays for next poll
 		}
 		t.offset += int64(len(s))
-		lines = append(lines, s[:len(s)-1])
+		lines = append(lines, strings.TrimRight(s, "\r\n"))
 	}
 	return lines, nil
 }

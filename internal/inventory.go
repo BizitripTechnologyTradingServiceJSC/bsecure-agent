@@ -3,6 +3,7 @@ package agent
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -116,6 +117,7 @@ func (c *Collector) socketOwners() map[string]int {
 
 func (c *Collector) ListeningPorts() []Port {
 	owners, procs := c.socketOwners(), c.processes()
+	byUID := c.commsByUID(procs)
 	ports := []Port{}
 	for _, f := range []struct{ file, proto, state string }{
 		{"/proc/net/tcp", "tcp", "0A"}, {"/proc/net/tcp6", "tcp6", "0A"}, {"/proc/net/udp", "udp", "07"}, {"/proc/net/udp6", "udp6", "07"},
@@ -125,9 +127,13 @@ func (c *Collector) ListeningPorts() []Port {
 			continue
 		}
 		for _, p := range ParseProcNet(string(b), f.proto, f.state) {
-			if inode := p.inode; inode != "" {
-				if pid, ok := owners[inode]; ok {
-					p.PID, p.Process = pid, procs[pid]
+			if pid, ok := owners[p.inode]; ok {
+				p.PID, p.Process = pid, procs[pid]
+			} else if names := byUID[p.uid]; len(names) == 1 && p.uid != "0" {
+				// /proc/<pid>/fd of another user's process needs CAP_SYS_PTRACE, which the hardened unit
+				// does not grant. The socket's uid is public: if that uid runs a single program, it's that one.
+				for n := range names {
+					p.Process = n
 				}
 			}
 			ports = append(ports, p.Port)
@@ -137,20 +143,37 @@ func (c *Collector) ListeningPorts() []Port {
 	return ports
 }
 
+// commsByUID maps a uid to the distinct program names it runs (from /proc/<pid>/status, readable by anyone).
+func (c *Collector) commsByUID(procs map[int]string) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	for pid, comm := range procs {
+		b, err := os.ReadFile(c.p(fmt.Sprintf("/proc/%d/status", pid)))
+		if err != nil {
+			continue
+		}
+		for _, l := range strings.Split(string(b), "\n") {
+			if v, ok := strings.CutPrefix(l, "Uid:"); ok {
+				if f := strings.Fields(v); len(f) > 0 {
+					if out[f[0]] == nil {
+						out[f[0]] = map[string]bool{}
+					}
+					out[f[0]][comm] = true
+				}
+				break
+			}
+		}
+	}
+	return out
+}
+
 type procPort struct {
 	Port
-	inode string
+	uid, inode string
 }
 
 // ParseProcNet parses /proc/net/{tcp,udp}[6] keeping only sockets in the given state.
-func ParseProcNet(data, proto, state string) []struct {
-	Port
-	inode string
-} {
-	var out []struct {
-		Port
-		inode string
-	}
+func ParseProcNet(data, proto, state string) []procPort {
+	var out []procPort
 	for i, l := range strings.Split(data, "\n") {
 		f := strings.Fields(l)
 		if i == 0 || len(f) < 10 || f[3] != state {
@@ -160,10 +183,7 @@ func ParseProcNet(data, proto, state string) []struct {
 		if !ok {
 			continue
 		}
-		out = append(out, struct {
-			Port
-			inode string
-		}{Port{Proto: proto, Addr: addr, Port: port}, f[9]})
+		out = append(out, procPort{Port{Proto: proto, Addr: addr, Port: port}, f[7], f[9]})
 	}
 	return out
 }

@@ -396,7 +396,8 @@ func (a *Agent) Run() error {
 	hb, ev, cm, inv := time.NewTicker(30*time.Second), time.NewTicker(10*time.Second), time.NewTicker(5*time.Second), time.NewTicker(5*time.Minute)
 	a.loadOutbox()
 	a.loadSeen()
-	a.RevertDue() // changes left unconfirmed across an agent restart
+	a.CollectEvents() // position every log tail now, so lines written before the first tick are not skipped
+	a.RevertDue()     // changes left unconfirmed across an agent restart
 	_ = a.Heartbeat()
 	if err := a.SendInventory(); err != nil {
 		log.Printf("inventory: %v", err)

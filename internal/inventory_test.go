@@ -130,3 +130,21 @@ func TestSSHParserCountsAttemptsNotLines(t *testing.T) {
 		t.Fatalf("got %d, want 2", n)
 	}
 }
+
+func TestPortOwnerByUIDWhenFdUnreadable(t *testing.T) {
+	root := t.TempDir()
+	// socket owned by uid 105, no readable fd link (as without CAP_SYS_PTRACE)
+	write(t, root, "/proc/net/tcp", "h\n 0: 00000000:22B8 00000000:0000 0A 0:0 0:0 0 105 0 777 1\n 1: 00000000:1F90 00000000:0000 0A 0:0 0:0 0 106 0 778 1\n")
+	write(t, root, "/proc/50/comm", "tinyproxy\n")
+	write(t, root, "/proc/50/status", "Name:\ttinyproxy\nUid:\t105\t105\t105\t105\n")
+	write(t, root, "/proc/51/comm", "tinyproxy\n")
+	write(t, root, "/proc/51/status", "Name:\ttinyproxy\nUid:\t105\t105\t105\t105\n")
+	write(t, root, "/proc/60/comm", "app-a\n")
+	write(t, root, "/proc/60/status", "Uid:\t106\t106\t106\t106\n")
+	write(t, root, "/proc/61/comm", "app-b\n")
+	write(t, root, "/proc/61/status", "Uid:\t106\t106\t106\t106\n")
+	ports := (&Collector{Root: root}).ListeningPorts()
+	if len(ports) != 2 || ports[0].Port != 8080 || ports[0].Process != "" || ports[1].Port != 8888 || ports[1].Process != "tinyproxy" {
+		t.Fatalf("%+v", ports) // uid 106 is ambiguous: no guess
+	}
+}
