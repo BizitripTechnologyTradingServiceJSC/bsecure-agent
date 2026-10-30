@@ -34,6 +34,25 @@ type Pending struct {
 	Value    string    `json:"value"`
 	Deadline time.Time `json:"deadline"`
 	Edits    []EditRec `json:"edits"`
+	Failures int       `json:"failures,omitempty"`
+}
+
+// RevertFailed records a failed auto-revert and postpones the next attempt (1m, 2m, 4m ... max 1h).
+func (m *ConfigManager) RevertFailed(p Pending) int {
+	ps := m.load()
+	for i := range ps {
+		if ps[i].CmdID == p.CmdID {
+			ps[i].Failures++
+			backoff := time.Minute << min(ps[i].Failures-1, 6)
+			if backoff > time.Hour {
+				backoff = time.Hour
+			}
+			ps[i].Deadline = m.Now().Add(backoff)
+			_ = m.save(ps)
+			return ps[i].Failures
+		}
+	}
+	return 0
 }
 
 // ConfigManager edits a small, fixed set of config files with backup, validation, verification and auto-rollback.

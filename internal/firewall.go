@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"os/exec"
@@ -100,10 +101,30 @@ func (n *NFT) Count() int {
 	}
 	total := 0
 	for _, s := range []string{"blocklist4", "blocklist6"} {
-		out, err := n.Run("", "nft", "-j", "list", "set", "inet", "fwctl", s)
-		if err == nil {
-			total += strings.Count(out, `"elem"`)
+		if out, err := n.Run("", "nft", "-j", "list", "set", "inet", "fwctl", s); err == nil {
+			total += CountSetElems(out)
 		}
 	}
 	return total
+}
+
+// CountSetElems counts elements in `nft -j list set` output ({"nftables":[...,{"set":{...,"elem":[...]}}]}).
+func CountSetElems(out string) int {
+	var doc struct {
+		Nftables []struct {
+			Set *struct {
+				Elem []json.RawMessage `json:"elem"`
+			} `json:"set"`
+		} `json:"nftables"`
+	}
+	if json.Unmarshal([]byte(out), &doc) != nil {
+		return 0
+	}
+	n := 0
+	for _, o := range doc.Nftables {
+		if o.Set != nil {
+			n += len(o.Set.Elem)
+		}
+	}
+	return n
 }

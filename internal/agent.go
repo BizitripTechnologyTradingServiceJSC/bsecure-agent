@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -50,6 +51,7 @@ type Agent struct {
 	mu     sync.Mutex
 	seen   map[string]time.Time
 	tails  []*logSource
+	outbox []result // command results not yet accepted by the panel (persisted)
 	events []Event
 }
 
@@ -79,7 +81,7 @@ func (a *Agent) do(method, path string, body, out any) error {
 	defer res.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if res.StatusCode >= 300 {
-		return fmt.Errorf("%s %s: %d %s", method, path, res.StatusCode, data)
+		return &httpError{res.StatusCode, fmt.Sprintf("%s %s: %d %s", method, path, res.StatusCode, data)}
 	}
 	if out != nil {
 		return json.Unmarshal(data, out)
@@ -146,7 +148,7 @@ func sources(cfg Config) []*logSource {
 // CollectEvents reads new log lines from every configured source into the buffer.
 func (a *Agent) CollectEvents() {
 	for _, src := range a.tails {
-		lines, err := src.tail.Read(500)
+		lines, err := src.tail.Read(20000) // busy nginx logs: keep up instead of falling behind forever
 		if err != nil {
 			continue
 		}
@@ -179,7 +181,18 @@ func (a *Agent) FlushEvents() error {
 	return nil
 }
 
-type pending struct{ ID, Payload, Signature string }
+type httpError struct {
+	code int
+	msg  string
+}
+
+func (e *httpError) Error() string { return e.msg }
+
+type result struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Output string `json:"output"`
+}
 
 func (a *Agent) seenFn(key string) bool {
 	a.mu.Lock()
@@ -210,9 +223,7 @@ func (a *Agent) PollCommands() error {
 	for _, p := range resp.Commands {
 		status, out := a.Execute(p.Payload, p.Signature)
 		log.Printf("command %s -> %s: %s", p.ID, status, out)
-		if err := a.do("POST", "/agent/commands/"+p.ID+"/result", map[string]string{"status": status, "output": out}, nil); err != nil {
-			log.Printf("report result: %v", err)
-		}
+		a.report(p.ID, status, out)
 	}
 	return nil
 }
@@ -256,9 +267,48 @@ func (a *Agent) Execute(payload, sig string) (string, string) {
 	return "success", trunc(out)
 }
 
+// report sends a command result; if the panel is unreachable it is queued on disk and retried,
+// so the panel never loses e.g. a "reverted" outcome. Results are delivered in order.
 func (a *Agent) report(cmdID, status, out string) {
-	if err := a.do("POST", "/agent/commands/"+cmdID+"/result", map[string]string{"status": status, "output": out}, nil); err != nil {
-		log.Printf("report result: %v", err)
+	a.outbox = append(a.outbox, result{cmdID, status, out})
+	a.FlushOutbox()
+}
+
+func (a *Agent) FlushOutbox() {
+	for len(a.outbox) > 0 {
+		r := a.outbox[0]
+		err := a.do("POST", "/agent/commands/"+r.ID+"/result", map[string]string{"status": r.Status, "output": r.Output}, nil)
+		var he *httpError
+		if err != nil && !(errors.As(err, &he) && he.code >= 400 && he.code < 500) {
+			log.Printf("report result %s (queued, will retry): %v", r.ID, err)
+			break // network/5xx: keep it and keep order
+		}
+		if err != nil {
+			log.Printf("panel refused result %s, dropping: %v", r.ID, err)
+		}
+		a.outbox = a.outbox[1:]
+	}
+	if len(a.outbox) > 1000 {
+		a.outbox = a.outbox[len(a.outbox)-1000:]
+	}
+	a.saveOutbox()
+}
+
+func (a *Agent) outboxPath() string { return filepath.Join(a.cfg.StateDir, "outbox.json") }
+
+func (a *Agent) saveOutbox() {
+	if a.cfg.StateDir == "" {
+		return
+	}
+	b, _ := json.Marshal(a.outbox)
+	if err := os.WriteFile(a.outboxPath(), b, 0o600); err != nil {
+		log.Printf("save outbox: %v", err)
+	}
+}
+
+func (a *Agent) loadOutbox() {
+	if b, err := os.ReadFile(a.outboxPath()); err == nil {
+		_ = json.Unmarshal(b, &a.outbox)
 	}
 }
 
@@ -266,8 +316,11 @@ func (a *Agent) report(cmdID, status, out string) {
 func (a *Agent) RevertDue() {
 	for _, p := range a.cm.Due() {
 		if err := a.cm.Revert(p); err != nil {
-			log.Printf("revert %s failed: %v", p.CmdID, err)
-			a.report(p.CmdID, "failed", trunc("auto-revert FAILED, manual action needed: "+err.Error()))
+			n := a.cm.RevertFailed(p) // retried with backoff, not every 5s
+			log.Printf("revert %s failed (attempt %d): %v", p.CmdID, n, err)
+			if n == 1 {
+				a.report(p.CmdID, "failed", trunc("auto-revert FAILED, manual action needed: "+err.Error()))
+			}
 			continue
 		}
 		log.Printf("reverted %s.%s (not confirmed in time)", p.Software, p.Key)
@@ -288,6 +341,7 @@ func (a *Agent) Run() error {
 		return err
 	}
 	hb, ev, cm, inv := time.NewTicker(30*time.Second), time.NewTicker(10*time.Second), time.NewTicker(5*time.Second), time.NewTicker(5*time.Minute)
+	a.loadOutbox()
 	a.RevertDue() // changes left unconfirmed across an agent restart
 	_ = a.Heartbeat()
 	if err := a.SendInventory(); err != nil {
@@ -310,6 +364,7 @@ func (a *Agent) Run() error {
 			}
 		case <-cm.C:
 			a.RevertDue() // before polling: a revert must not wait on the network
+			a.FlushOutbox()
 			if err := a.PollCommands(); err != nil {
 				log.Printf("commands: %v", err)
 			}

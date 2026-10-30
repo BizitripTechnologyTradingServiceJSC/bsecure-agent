@@ -47,11 +47,12 @@ func ParseSSH(line string, now time.Time) *Event {
 	return nil
 }
 
-// Tail polls a file from its current end, handling truncation/rotation.
+// Tail polls a file from its current end, handling truncation and rotation (rename + new file).
 type Tail struct {
 	Path   string
 	offset int64
 	init   bool
+	file   os.FileInfo // identity of the file the offset belongs to
 }
 
 func (t *Tail) Read(max int) ([]string, error) {
@@ -65,12 +66,14 @@ func (t *Tail) Read(max int) ([]string, error) {
 		return nil, err
 	}
 	if !t.init {
-		t.offset, t.init = st.Size(), true
+		t.offset, t.init, t.file = st.Size(), true, st
 		return nil, nil
 	}
-	if st.Size() < t.offset {
+	// A rotated-in file can already be larger than our old offset, so size alone cannot detect rotation.
+	if !os.SameFile(t.file, st) || st.Size() < t.offset {
 		t.offset = 0
 	}
+	t.file = st
 	if _, err := f.Seek(t.offset, io.SeekStart); err != nil {
 		return nil, err
 	}

@@ -71,8 +71,11 @@ func Verify(pub ed25519.PublicKey, serverID, payload, sigB64 string, now time.Ti
 		if err != nil {
 			return nil, errors.New("invalid ip")
 		}
-		if err := guard.CheckIP(ip.Unmap()); err != nil {
-			return nil, err
+		// Unblock is always allowed (e.g. an admin IP added to the allowlist after it was blocked).
+		if c.Action == "block_ip" {
+			if err := guard.CheckIP(ip.Unmap()); err != nil {
+				return nil, err
+			}
 		}
 		if c.Action == "block_ip" && (c.Params.TTLSeconds < MinBlockTTL || c.Params.TTLSeconds > MaxBlockTTL) {
 			return nil, errors.New("ttlSeconds out of range")
@@ -121,9 +124,26 @@ func ParseGuard(list []string) (*Guard, error) {
 	return g, nil
 }
 
+// Cloudflare edge (https://www.cloudflare.com/ips/): behind a proxied site these are the "clients" nginx sees.
+var cloudflare = func() []netip.Prefix {
+	var out []netip.Prefix
+	for _, s := range []string{"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+		"108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15",
+		"104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22", "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+		"2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32"} {
+		out = append(out, netip.MustParsePrefix(s))
+	}
+	return out
+}()
+
 func (g *Guard) CheckIP(ip netip.Addr) error {
 	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() {
 		return errors.New("refusing loopback/unspecified/multicast address")
+	}
+	for _, p := range cloudflare {
+		if p.Contains(ip) {
+			return errors.New("refusing Cloudflare edge address: block it at Cloudflare instead")
+		}
 	}
 	for _, p := range g.Allow {
 		if p.Contains(ip) {

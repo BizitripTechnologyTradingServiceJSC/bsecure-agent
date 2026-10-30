@@ -31,4 +31,8 @@ Quy trình mỗi lần đổi: kiểm tra khoá không bị khoá cửa (sshd c�
 Biến môi trường: `PANEL_URL`, `ENROLL_TOKEN`, `PANEL_PUBKEY` (nên ghim), `AGENT_NAME`, `STATE_DIR` (/var/lib/fwagent), `AUTH_LOG` (/var/log/auth.log), `NGINX_ACCESS_LOG` (/var/log/nginx/access.log), `SYSLOG` (/var/log/syslog); để trống để tắt nguồn đó, `ADMIN_ALLOWLIST`, `DRY_RUN`, `ALLOW_CONFIG_CHANGES` (false).
 systemd: `deploy/fwagent.service`. Test: `go test ./...`
 
+- Kết quả lệnh được lưu vào `STATE_DIR/outbox.json` khi panel không với tới được và gửi lại theo đúng thứ tự, nên panel không bỏ lỡ kết quả "đã tự hoàn tác".
+- Không bao giờ chặn IP Cloudflare edge hay IP trong `ADMIN_ALLOWLIST`; gỡ chặn thì luôn được.
+- Mất `state.json` (cài lại máy) thì admin phải bấm **Reset enroll** trên panel trước khi agent đăng ký lại.
+
 Chưa chạy `nft` thật; thử trên máy lab có console trước khi đặt `DRY_RUN=false`.
