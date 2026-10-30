@@ -21,17 +21,19 @@ import (
 const Version = "0.1.0"
 
 type Config struct {
-	PanelURL    string
-	Name        string
-	EnrollToken string
-	StateDir    string
-	AuthLog     string
-	NginxLog    string
-	Syslog      string
-	DryRun      bool
-	Allowlist   []string
-	AllowConfig bool   // opt-in: allow signed set_config commands to edit sshd/nginx/tinyproxy config
-	PanelPubKey string // base64 raw ed25519; pinned out-of-band, overrides what enroll returns
+	PanelURL      string
+	Name          string
+	EnrollToken   string
+	StateDir      string
+	AuthLog       string
+	NginxLog      string
+	Syslog        string
+	DryRun        bool
+	Allowlist     []string
+	AllowConfig   bool // opt-in: allow signed set_config commands to edit sshd/nginx/tinyproxy config
+	PanelPubKey   string
+	TLS           TLSConfig
+	AllowInsecure bool // permit http:// PANEL_URL (testing only) // base64 raw ed25519; pinned out-of-band, overrides what enroll returns
 }
 
 type state struct {
@@ -60,7 +62,11 @@ func New(cfg Config, fw Firewall) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{cfg: cfg, fw: fw, cm: NewConfigManager(cfg.StateDir), guard: g, http: &http.Client{Timeout: 15 * time.Second}, seen: map[string]time.Time{}, tails: sources(cfg)}, nil
+	hc, err := NewHTTPClient(cfg.PanelURL, cfg.TLS, cfg.AllowInsecure)
+	if err != nil {
+		return nil, err
+	}
+	return &Agent{cfg: cfg, fw: fw, cm: NewConfigManager(cfg.StateDir), guard: g, http: hc, seen: map[string]time.Time{}, tails: sources(cfg)}, nil
 }
 
 func (a *Agent) do(method, path string, body, out any) error {
