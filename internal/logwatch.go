@@ -19,17 +19,67 @@ type Event struct {
 }
 
 var (
-	reFailed  = regexp.MustCompile(`Failed (?:password|publickey) for (?:invalid user )?(\S+) from (\S+) port`)
-	reInvalid = regexp.MustCompile(`Invalid user (\S+) from (\S+)`)
+	// group 1 user, 2 ip, 3 port
+	reFailed  = regexp.MustCompile(`Failed (?:password|publickey|keyboard-interactive/pam) for (?:invalid user )?(\S+) from (\S+) port (\d+)`)
+	reInvalid = regexp.MustCompile(`Invalid user (\S*) from (\S+)(?: port (\d+))?`) // older sshd omits the port
+	rePreauth = regexp.MustCompile(`(?:Connection closed by|Disconnected from) (?:authenticating|invalid) user (\S*) (\S+) port (\d+) \[preauth\]`)
 )
 
-// ParseSSH turns an auth.log line into a normalised event. The username is redacted from the raw line.
-func ParseSSH(line string, now time.Time) *Event {
-	for _, re := range []*regexp.Regexp{reFailed, reInvalid} {
+// SSHParser counts authentication attempts, not log lines. sshd writes several lines per connection
+// ("Invalid user", then one "Failed password" per try, then "Connection closed ... [preauth]"):
+// every failed try counts once; the other lines count only for a connection that made no failed try
+// (e.g. key-only scanners), so one bad login is no longer counted twice.
+type SSHParser struct {
+	conns map[string]*sshConn
+	calls int
+}
+
+type sshConn struct {
+	placeholder bool // an Invalid/preauth line was counted and will absorb the next failed try
+	counted     bool // at least one event was emitted for this connection
+	seen        time.Time
+}
+
+func NewSSHParser() *SSHParser { return &SSHParser{conns: map[string]*sshConn{}} }
+
+// ParseSSH parses a single line without connection context (kept for callers that need a pure function).
+func ParseSSH(line string, now time.Time) *Event { return NewSSHParser().Parse(line, now) }
+
+func (p *SSHParser) Parse(line string, now time.Time) *Event {
+	if p.calls++; p.calls%1000 == 0 {
+		for k, c := range p.conns {
+			if now.Sub(c.seen) > 10*time.Minute {
+				delete(p.conns, k)
+			}
+		}
+	}
+	for i, re := range []*regexp.Regexp{reFailed, reInvalid, rePreauth} {
 		m := re.FindStringSubmatchIndex(line)
 		if m == nil {
 			continue
 		}
+		key := line[m[4]:m[5]]
+		if m[6] >= 0 {
+			key += "|" + line[m[6]:m[7]]
+		}
+		c := p.conns[key]
+		if c == nil {
+			c = &sshConn{}
+			p.conns[key] = c
+		}
+		c.seen = now
+		if i == 0 { // a real failed attempt
+			if c.placeholder {
+				c.placeholder = false // already counted by the earlier Invalid line
+				return nil
+			}
+		} else { // Invalid user / preauth close: only the first line of a connection counts
+			if c.placeholder || c.counted {
+				return nil
+			}
+			c.placeholder = true
+		}
+		c.counted = true
 		user, ip := line[m[2]:m[3]], line[m[4]:m[5]]
 		addr, err := netip.ParseAddr(ip)
 		if err != nil {

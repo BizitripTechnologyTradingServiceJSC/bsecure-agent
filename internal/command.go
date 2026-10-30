@@ -103,6 +103,19 @@ func Verify(pub ed25519.PublicKey, serverID, payload, sigB64 string, now time.Ti
 // Guard holds local safety rules that the panel cannot override.
 type Guard struct {
 	Allow []netip.Prefix // admin IPs/CIDRs that are never blocked
+	extra []netip.Prefix // additional never-block ranges pushed by the panel (e.g. refreshed Cloudflare list)
+}
+
+// AddNeverBlock replaces the panel-provided never-block ranges. It can only make the guard stricter.
+func (g *Guard) AddNeverBlock(cidrs []string) int {
+	var out []netip.Prefix
+	for _, s := range cidrs {
+		if p, err := netip.ParsePrefix(s); err == nil && len(out) < 500 {
+			out = append(out, p.Masked())
+		}
+	}
+	g.extra = out
+	return len(out)
 }
 
 func ParseGuard(list []string) (*Guard, error) {
@@ -140,7 +153,7 @@ func (g *Guard) CheckIP(ip netip.Addr) error {
 	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() {
 		return errors.New("refusing loopback/unspecified/multicast address")
 	}
-	for _, p := range cloudflare {
+	for _, p := range append(cloudflare[:len(cloudflare):len(cloudflare)], g.extra...) {
 		if p.Contains(ip) {
 			return errors.New("refusing Cloudflare edge address: block it at Cloudflare instead")
 		}

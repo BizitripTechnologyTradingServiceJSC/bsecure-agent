@@ -127,10 +127,17 @@ func (a *Agent) loadKey() error {
 }
 
 func (a *Agent) Heartbeat() error {
-	return a.do("POST", "/agent/heartbeat", map[string]any{
+	var resp struct {
+		NeverBlock []string `json:"neverBlock"`
+	}
+	err := a.do("POST", "/agent/heartbeat", map[string]any{
 		"agentVersion": Version, "os": runtime.GOOS + "/" + runtime.GOARCH, "dryRun": a.cfg.DryRun, "allowConfig": a.cfg.AllowConfig,
 		"firewall": map[string]any{"backend": a.fw.Backend(), "ready": true, "blocked": a.fw.Count()},
-	}, nil)
+	}, &resp)
+	if err == nil && resp.NeverBlock != nil {
+		a.guard.AddNeverBlock(resp.NeverBlock)
+	}
+	return err
 }
 
 type logSource struct {
@@ -143,7 +150,7 @@ func sources(cfg Config) []*logSource {
 	for _, s := range []struct {
 		path string
 		p    Parser
-	}{{cfg.AuthLog, ParseSSH}, {cfg.NginxLog, ParseNginxAccess}, {cfg.Syslog, ParseSyslog}} {
+	}{{cfg.AuthLog, NewSSHParser().Parse}, {cfg.NginxLog, ParseNginxAccess}, {cfg.Syslog, ParseSyslog}} {
 		if s.path != "" {
 			out = append(out, &logSource{&Tail{Path: s.path}, s.p})
 		}
@@ -212,7 +219,26 @@ func (a *Agent) seenFn(key string) bool {
 		return true
 	}
 	a.seen[key] = time.Now()
+	a.saveSeen() // replay protection must survive an agent restart within a command's validity window
 	return false
+}
+
+func (a *Agent) seenPath() string { return filepath.Join(a.cfg.StateDir, "seen.json") }
+
+func (a *Agent) saveSeen() {
+	if a.cfg.StateDir == "" {
+		return
+	}
+	b, _ := json.Marshal(a.seen)
+	if err := os.WriteFile(a.seenPath(), b, 0o600); err != nil {
+		log.Printf("save seen: %v", err)
+	}
+}
+
+func (a *Agent) loadSeen() {
+	if b, err := os.ReadFile(a.seenPath()); err == nil {
+		_ = json.Unmarshal(b, &a.seen)
+	}
 }
 
 func (a *Agent) PollCommands() error {
@@ -348,6 +374,7 @@ func (a *Agent) Run() error {
 	}
 	hb, ev, cm, inv := time.NewTicker(30*time.Second), time.NewTicker(10*time.Second), time.NewTicker(5*time.Second), time.NewTicker(5*time.Minute)
 	a.loadOutbox()
+	a.loadSeen()
 	a.RevertDue() // changes left unconfirmed across an agent restart
 	_ = a.Heartbeat()
 	if err := a.SendInventory(); err != nil {

@@ -321,8 +321,45 @@ func (m *ConfigManager) reload(sw string) error {
 			return nil
 		}
 		last = out
+		if noSystemd(out, err) {
+			return m.reloadWithoutSystemd(sw)
+		}
 	}
 	return fmt.Errorf("systemctl %s failed: %s", verb, trunc(last))
+}
+
+func noSystemd(out string, err error) bool {
+	s := out + " " + err.Error()
+	return strings.Contains(s, "executable file not found") || strings.Contains(s, "not been booted with systemd") ||
+		strings.Contains(s, "Failed to connect to bus")
+}
+
+// reloadWithoutSystemd covers containers and OpenRC/sysvinit hosts. Signals go to the master process from
+// its pid file only (pkill would also hit per-session sshd children).
+func (m *ConfigManager) reloadWithoutSystemd(sw string) error {
+	if sw == "nginx" {
+		if out, err := m.Run("", "nginx", "-s", "reload"); err != nil {
+			return fmt.Errorf("nginx -s reload failed: %s", trunc(out))
+		}
+		return nil
+	}
+	pidFiles := map[string][]string{
+		"sshd":      {"/run/sshd.pid", "/var/run/sshd.pid"},
+		"tinyproxy": {"/run/tinyproxy/tinyproxy.pid", "/var/run/tinyproxy/tinyproxy.pid", "/run/tinyproxy.pid"},
+	}[sw]
+	sig := map[string]string{"sshd": "-HUP", "tinyproxy": "-USR1"}[sw] // tinyproxy re-reads its config on USR1
+	for _, f := range pidFiles {
+		b, ok := m.read(f)
+		pid := strings.TrimSpace(b)
+		if !ok || !regexp.MustCompile(`^[1-9][0-9]*$`).MatchString(pid) {
+			continue
+		}
+		if out, err := m.Run("", "kill", sig, pid); err != nil {
+			return fmt.Errorf("kill %s %s failed: %s", sig, pid, trunc(out))
+		}
+		return nil
+	}
+	return fmt.Errorf("no systemd and no pid file found for %s", sw)
 }
 
 func (m *ConfigManager) verify(c Change) error {

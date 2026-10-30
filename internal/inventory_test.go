@@ -95,3 +95,38 @@ func TestEmptyInventoryMarshalsArrays(t *testing.T) {
 		t.Fatalf("nil slices would serialise as null: %s", b)
 	}
 }
+
+func TestSSHParserCountsAttemptsNotLines(t *testing.T) {
+	p, now := NewSSHParser(), time.Now()
+	n := 0
+	feed := func(lines ...string) {
+		for _, l := range lines {
+			if p.Parse(l, now) != nil {
+				n++
+			}
+		}
+	}
+	// invalid user with 3 password tries, then the close line: 3 attempts
+	feed("sshd[1]: Invalid user admin from 203.0.113.9 port 4000",
+		"sshd[1]: Failed password for invalid user admin from 203.0.113.9 port 4000 ssh2",
+		"sshd[1]: Failed password for invalid user admin from 203.0.113.9 port 4000 ssh2",
+		"sshd[1]: Failed password for invalid user admin from 203.0.113.9 port 4000 ssh2",
+		"sshd[1]: Connection closed by invalid user admin 203.0.113.9 port 4000 [preauth]")
+	if n != 3 {
+		t.Fatalf("got %d, want 3", n)
+	}
+	// key-only scanner: no Failed line at all, still counted once
+	n = 0
+	feed("sshd[2]: Connection closed by authenticating user root 198.51.100.4 port 5000 [preauth]")
+	feed("sshd[3]: Invalid user test from 198.51.100.4 port 5001", "sshd[3]: Disconnected from invalid user test 198.51.100.4 port 5001 [preauth]")
+	feed("sshd[5]: Disconnected from invalid user oracle 198.51.100.9 port 7000 [preauth]")
+	if n != 3 {
+		t.Fatalf("got %d, want 3", n)
+	}
+	// existing user, 2 failures on one connection
+	n = 0
+	feed("sshd[4]: Failed password for root from 192.0.2.7 port 6000 ssh2", "sshd[4]: Failed password for root from 192.0.2.7 port 6000 ssh2")
+	if n != 2 {
+		t.Fatalf("got %d, want 2", n)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,5 +124,51 @@ func TestRevertDueReportsFailureOnce(t *testing.T) {
 	}
 	if posts.Load() != 1 {
 		t.Fatalf("failure reported %d times", posts.Load())
+	}
+}
+
+func TestHeartbeatNeverBlockAndSeenPersistence(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true,"neverBlock":["198.18.240.0/20","garbage"]}`))
+	}))
+	defer srv.Close()
+	g, _ := ParseGuard(nil)
+	dir := t.TempDir()
+	a := &Agent{cfg: Config{PanelURL: srv.URL, StateDir: dir}, http: srv.Client(), guard: g, fw: &NFT{DryRun: true}, seen: map[string]time.Time{}}
+	if err := a.Heartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	if g.CheckIP(netip.MustParseAddr("198.18.240.9")) == nil || g.CheckIP(netip.MustParseAddr("203.0.113.9")) != nil {
+		t.Fatal("panel-provided never-block range not applied")
+	}
+	// replay protection survives restart
+	if a.seenFn("cmd1nonce") {
+		t.Fatal("first use flagged")
+	}
+	b := &Agent{cfg: a.cfg, seen: map[string]time.Time{}}
+	b.loadSeen()
+	if !b.seenFn("cmd1nonce") {
+		t.Fatal("replay after restart not detected")
+	}
+}
+
+func TestReloadWithoutSystemd(t *testing.T) {
+	m, f, root := newMgr(t)
+	f.sshdT = func() string { return "x11forwarding no\n" }
+	write(t, root, "/run/sshd.pid", "4242\n")
+	f.failOn = "systemctl"
+	run := f.run
+	m.Run = func(in, name string, args ...string) (string, error) {
+		out, err := run(in, name, args...)
+		if name == "systemctl" {
+			return "System has not been booted with systemd as init system (PID 1). Can't operate.", err
+		}
+		return out, err
+	}
+	if st, out := m.Apply("aaaaaaaaaaaaaaaaaaaaaaaa", Change{"sshd", "X11Forwarding", "no"}, 60, false); st != "pending_confirm" {
+		t.Fatalf("%s %s", st, out)
+	}
+	if !f.called("kill -HUP 4242") {
+		t.Fatalf("expected HUP to sshd master pid: %v", f.calls)
 	}
 }
