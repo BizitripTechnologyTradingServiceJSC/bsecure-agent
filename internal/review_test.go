@@ -135,7 +135,7 @@ func TestHeartbeatNeverBlockAndSeenPersistence(t *testing.T) {
 	defer srv.Close()
 	g, _ := ParseGuard(nil)
 	dir := t.TempDir()
-	a := &Agent{cfg: Config{PanelURL: srv.URL, StateDir: dir}, http: srv.Client(), guard: g, fw: &NFT{DryRun: true}, seen: map[string]time.Time{}}
+	a := &Agent{cfg: Config{PanelURL: srv.URL, StateDir: dir}, http: srv.Client(), guard: g, fw: &NFT{DryRun: true}, seen: map[string]time.Time{}, agg: NewAggregator()}
 	if err := a.Heartbeat(); err != nil {
 		t.Fatal(err)
 	}

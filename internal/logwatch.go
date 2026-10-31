@@ -107,18 +107,26 @@ type Tail struct {
 }
 
 func (t *Tail) Read(max int) ([]string, error) {
+	var lines []string
+	_, err := t.Each(max, func(b []byte) { lines = append(lines, strings.TrimRight(string(b), "\r\n")) })
+	return lines, err
+}
+
+// Each hands every complete new line to fn (at most max lines) without copying it; fn must not keep the slice.
+// It returns how many bytes of the file are still unread afterwards, so a caller can see it is falling behind.
+func (t *Tail) Each(max int, fn func(line []byte)) (backlog int64, err error) {
 	f, err := os.Open(t.Path)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if !t.init {
 		t.offset, t.init, t.file = st.Size(), true, st
-		return nil, nil
+		return 0, nil
 	}
 	// A rotated-in file can already be larger than our old offset, so size alone cannot detect rotation.
 	if !os.SameFile(t.file, st) || st.Size() < t.offset {
@@ -126,17 +134,47 @@ func (t *Tail) Read(max int) ([]string, error) {
 	}
 	t.file = st
 	if _, err := f.Seek(t.offset, io.SeekStart); err != nil {
-		return nil, err
+		return 0, err
 	}
-	var lines []string
-	r := bufio.NewReader(f)
-	for len(lines) < max {
-		s, err := r.ReadString('\n')
+	r := bufio.NewReaderSize(f, 64<<10)
+	for n := 0; n < max; {
+		b, err := r.ReadSlice('\n')
+		if err == bufio.ErrBufferFull { // a line longer than 64 KiB is not a log line we care about: skip it whole
+			t.offset += int64(len(b))
+			for err == bufio.ErrBufferFull {
+				b, err = r.ReadSlice('\n')
+				t.offset += int64(len(b))
+			}
+			if err != nil {
+				break
+			}
+			n++
+			continue
+		}
 		if err != nil {
 			break // partial last line stays for next poll
 		}
-		t.offset += int64(len(s))
-		lines = append(lines, strings.TrimRight(s, "\r\n"))
+		t.offset += int64(len(b))
+		n++
+		fn(b[:len(b)-1])
 	}
-	return lines, nil
+	return max64(st.Size()-t.offset, 0), nil
+}
+
+// SkipToEnd gives up on whatever is still unread (load shedding) and returns how many bytes were skipped.
+func (t *Tail) SkipToEnd() int64 {
+	st, err := os.Stat(t.Path)
+	if err != nil || st.Size() <= t.offset {
+		return 0
+	}
+	n := st.Size() - t.offset
+	t.offset = st.Size()
+	return n
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }

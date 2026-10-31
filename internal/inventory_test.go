@@ -148,3 +148,44 @@ func TestPortOwnerByUIDWhenFdUnreadable(t *testing.T) {
 		t.Fatalf("%+v", ports) // uid 106 is ambiguous: no guess
 	}
 }
+
+func TestInventoryDoesNotForkAgainWhenNothingChanged(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "/etc/ssh/sshd_config", "PermitRootLogin no\n")
+	runs := map[string]int{}
+	c := &Collector{Root: root, Run: func(_ string, name string, args ...string) (string, error) {
+		runs[name]++
+		return "OpenSSH_9.6p1\nPermitRootLogin no\n", nil
+	}}
+	c.Collect()
+	c.Collect()
+	c.Collect()
+	if runs["sshd"] != 1 || runs["ssh"] != 1 {
+		t.Fatalf("external programs ran again: %v", runs)
+	}
+	write(t, root, "/etc/ssh/sshd_config", "PermitRootLogin yes\n") // config changed: effective config must be re-read
+	c.Collect()
+	if runs["sshd"] != 2 {
+		t.Fatalf("changed config not re-read: %v", runs)
+	}
+}
+
+func TestSocketOwnerWalkOnlyForNewListeners(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "/proc/net/tcp", "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4242 1 0 100 0 0 10 0\n")
+	write(t, root, "/proc/7/comm", "nginx\n")
+	if err := os.MkdirAll(root+"/proc/7/fd", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("socket:[4242]", root+"/proc/7/fd/3"); err != nil {
+		t.Fatal(err)
+	}
+	c := &Collector{Root: root}
+	if p := c.ListeningPorts(); len(p) != 1 || p[0].PID != 7 {
+		t.Fatalf("%+v", p)
+	}
+	os.Remove(root + "/proc/7/fd/3") // a second inventory must be served from the cache without walking fds
+	if p := c.ListeningPorts(); len(p) != 1 || p[0].PID != 7 {
+		t.Fatalf("cache not used: %+v", p)
+	}
+}

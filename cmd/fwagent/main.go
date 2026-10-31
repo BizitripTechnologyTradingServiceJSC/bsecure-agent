@@ -35,6 +35,7 @@ func splitList(s string) []string {
 }
 
 func main() {
+	limitSelf()
 	host, _ := os.Hostname()
 	cfg := agent.Config{
 		PanelURL:    strings.TrimRight(env("PANEL_URL", ""), "/"),

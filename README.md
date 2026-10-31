@@ -23,6 +23,7 @@ Chứng chỉ tạo bằng `scripts/gen-certs.sh` trong bsecure-cp (CN phải tr
   - nginx access (`NGINX_ACCESS_LOG`): dò quét như `/.env`, `wp-login.php`, path traversal, SQLi/XSS, và 401. Query string và User-Agent bị bỏ.
   - syslog (`SYSLOG`): sudo thất bại, OOM kill, user mới, segfault.
 - Phát hiện xoay vòng log theo danh tính file (không chỉ theo kích thước).
+- **Nấu ngay khi đọc**: sự kiện có IP được gộp trong bộ nhớ theo (phút, loại, IP) và gửi lên `/agent/rollups` dưới dạng số đếm + một dòng mẫu (đã bỏ giờ/host, IP thành `<ip>`); tên user chỉ gửi dạng băm 8 hex. Sự kiện không có IP (sudo, OOM...) gửi riêng qua `/agent/events`. Đọc gần thời gian thực: inotify đánh thức vòng lặp (gộp ≤5 lần/giây), có thêm vòng quét an toàn mỗi 10 giây; một nguồn tích đủ 10 lần thử thì gửi sớm (tối đa 1 lần/2 giây).
 - Agent chỉ báo dữ kiện; việc chấm điểm nằm ở Control Panel.
 
 ## Đổi cấu hình phần mềm (tắt mặc định)
@@ -37,6 +38,16 @@ Bật bằng `ALLOW_CONFIG_CHANGES=true` (kèm `deploy/fwagent-config.conf` nế
 Quy trình mỗi lần đổi: kiểm tra không tự khoá cửa (sshd cần có `authorized_keys`) → sao lưu → ghi file nguyên tử → `sshd -t` / `nginx -t` → reload → **kiểm tra giá trị hiệu lực** (`sshd -T`, đọc lại cấu hình nginx, tinyproxy còn chạy) → bất kỳ bước nào lỗi thì **khôi phục bản cũ** và reload lại. Nếu thành công, thay đổi ở trạng thái `pending_confirm` và **tự hoàn tác sau 30–900 giây (mặc định 120)** nếu không có lệnh `confirm_config` (kể cả khi agent khởi động lại giữa chừng). Hoàn tác thất bại thì thử lại giãn dần 1 phút → 1 giờ và chỉ báo lỗi một lần.
 
 Reload dùng `systemctl`; trên máy không có systemd (container, OpenRC) thì dùng `nginx -s reload`, HUP cho sshd và USR1 cho tinyproxy qua pid file.
+
+## Không làm nặng server
+Agent được thiết kế để không bao giờ là lý do server chậm:
+- **Đọc log**: lọc nhanh không cấp phát bộ nhớ trước khi chạy regex (~1 µs/dòng nginx, nhanh hơn ~6 lần so với regex mọi dòng); chỉ chiếm tối đa **10% một core** (sau mỗi lượt đọc tốn *d* giây thì nghỉ *9d*); nếu tụt quá 8 MiB thì bỏ qua đoạn cũ, ghi vào bộ đếm `dropped` và log `skipped ahead`.
+- **Bộ nhớ**: tối đa 20 000 bộ đếm, 500 sự kiện hiếm, 16 user/bộ đếm; `GOMEMLIMIT` mềm 96 MiB; `GOMAXPROCS` ≤ 2; nice 10.
+- **Inventory**: cache phiên bản (1 giờ) và kết quả `sshd -T` (theo hash cấu hình), chỉ duyệt `/proc/*/fd` khi có cổng nghe mới, chỉ gửi lại khi thay đổi (hoặc mỗi 30 phút); số IP đang chặn của nft được cache 2 phút.
+- **systemd** (`deploy/fwagent.service`): `Nice=10`, `CPUWeight=20`, `CPUQuota=15%`, `MemoryHigh=96M`, `MemoryMax=160M`, `TasksMax=64`, `IOSchedulingClass=idle`, `OOMScoreAdjust=500`.
+- Agent tự báo CPU %, RSS, dòng/giây, số bị bỏ trong heartbeat (`stats`) để panel hiển thị.
+
+Đo thực tế (4 core, máy sinh log chạy cùng máy, `DRY_RUN`, log nginx + sshd): 20 000 dòng/giây ≈ 1,5% một core; 100 000 dòng/giây ≈ 4,7% một core, RSS ~16 MB, vẫn ghi nhận ~98% số lần thử đáng ngờ.
 
 ## Biến môi trường
 | Biến | Mặc định | Ý nghĩa |

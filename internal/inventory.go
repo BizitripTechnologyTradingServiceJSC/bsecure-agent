@@ -47,7 +47,21 @@ type Inventory struct {
 type Collector struct {
 	Root string
 	Run  Runner
+
+	// Caches, so a periodic inventory does not fork programs or walk every process's file descriptors when nothing changed.
+	verCache   map[string]verEntry
+	sshdHash   string
+	sshdConf   map[string]any
+	ownerCache map[string]int // socket inode -> pid
+	ownerAt    time.Time
 }
+
+type verEntry struct {
+	v  string
+	at time.Time
+}
+
+const versionTTL = time.Hour
 
 func (c *Collector) p(path string) string { return filepath.Join(c.Root, path) }
 
@@ -99,26 +113,69 @@ func (c *Collector) processes() map[int]string {
 	return out
 }
 
-func (c *Collector) socketOwners() map[string]int {
+// socketOwners finds which process holds each wanted socket inode. Walking /proc/*/fd is the most expensive thing
+// the agent does (thousands of readlinks on a busy web server), so results are cached and the walk only happens for
+// inodes not seen before — i.e. when a new listener appeared.
+func (c *Collector) socketOwners(want map[string]bool) map[string]int {
+	if time.Since(c.ownerAt) > time.Hour {
+		c.ownerCache, c.ownerAt = nil, time.Now() // re-resolve now and then in case a socket changed hands
+	}
 	owners := map[string]int{}
-	fds, _ := filepath.Glob(c.p("/proc/[0-9]*/fd/*"))
-	for _, fd := range fds {
-		l, err := os.Readlink(fd)
-		if err != nil || !strings.HasPrefix(l, "socket:[") {
-			continue
-		}
-		parts := strings.Split(strings.TrimPrefix(fd, c.Root), "/")
-		if pid, err := strconv.Atoi(parts[2]); err == nil {
-			owners[strings.TrimSuffix(strings.TrimPrefix(l, "socket:["), "]")] = pid
+	cache := map[string]int{} // 0 = looked for and not visible to us; not walked for again
+	missing := false
+	for in := range want {
+		if pid, ok := c.ownerCache[in]; ok {
+			cache[in] = pid
+			if pid != 0 {
+				owners[in] = pid
+			}
+		} else {
+			missing = true
 		}
 	}
+	if missing {
+		const maxLinks = 200000 // hard bound on the work of one walk
+		links := 0
+		pids, _ := filepath.Glob(c.p("/proc/[0-9]*"))
+		for _, dir := range pids {
+			pid, err := strconv.Atoi(filepath.Base(dir))
+			if err != nil {
+				continue
+			}
+			ents, err := os.ReadDir(dir + "/fd")
+			if err != nil {
+				continue
+			}
+			for _, e := range ents {
+				if links++; links > maxLinks {
+					break
+				}
+				l, err := os.Readlink(dir + "/fd/" + e.Name())
+				if err != nil || !strings.HasPrefix(l, "socket:[") {
+					continue
+				}
+				in := strings.TrimSuffix(strings.TrimPrefix(l, "socket:["), "]")
+				if want[in] {
+					owners[in], cache[in] = pid, pid
+				}
+			}
+		}
+	}
+	for in := range want {
+		if _, ok := cache[in]; !ok {
+			cache[in] = 0
+		}
+	}
+	c.ownerCache = cache // only sockets that are listening now are remembered
 	return owners
 }
 
 func (c *Collector) ListeningPorts() []Port {
-	owners, procs := c.socketOwners(), c.processes()
+	procs := c.processes()
 	byUID := c.commsByUID(procs)
 	ports := []Port{}
+	var socks []procPort
+	want := map[string]bool{}
 	for _, f := range []struct{ file, proto, state string }{
 		{"/proc/net/tcp", "tcp", "0A"}, {"/proc/net/tcp6", "tcp6", "0A"}, {"/proc/net/udp", "udp", "07"}, {"/proc/net/udp6", "udp6", "07"},
 	} {
@@ -127,17 +184,22 @@ func (c *Collector) ListeningPorts() []Port {
 			continue
 		}
 		for _, p := range ParseProcNet(string(b), f.proto, f.state) {
-			if pid, ok := owners[p.inode]; ok {
-				p.PID, p.Process = pid, procs[pid]
-			} else if names := byUID[p.uid]; len(names) == 1 && p.uid != "0" {
-				// /proc/<pid>/fd of another user's process needs CAP_SYS_PTRACE, which the hardened unit
-				// does not grant. The socket's uid is public: if that uid runs a single program, it's that one.
-				for n := range names {
-					p.Process = n
-				}
-			}
-			ports = append(ports, p.Port)
+			socks = append(socks, p)
+			want[p.inode] = true
 		}
+	}
+	owners := c.socketOwners(want)
+	for _, p := range socks {
+		if pid, ok := owners[p.inode]; ok {
+			p.PID, p.Process = pid, procs[pid]
+		} else if names := byUID[p.uid]; len(names) == 1 && p.uid != "0" {
+			// /proc/<pid>/fd of another user's process needs CAP_SYS_PTRACE, which the hardened unit
+			// does not grant. The socket's uid is public: if that uid runs a single program, it's that one.
+			for n := range names {
+				p.Process = n
+			}
+		}
+		ports = append(ports, p.Port)
 	}
 	sort.Slice(ports, func(i, j int) bool { return ports[i].Port < ports[j].Port })
 	return ports
@@ -211,8 +273,17 @@ func (c *Collector) version(name string, args ...string) string {
 	if c.Run == nil {
 		return ""
 	}
+	key := name + " " + strings.Join(args, " ")
+	if e, ok := c.verCache[key]; ok && time.Since(e.at) < versionTTL {
+		return e.v
+	}
 	out, _ := c.Run("", name, args...)
-	return verRe.FindString(out)
+	v := verRe.FindString(out)
+	if c.verCache == nil {
+		c.verCache = map[string]verEntry{}
+	}
+	c.verCache[key] = verEntry{v, time.Now()}
+	return v
 }
 
 func hashFiles(files []string, data []string) string {
@@ -283,9 +354,13 @@ func (c *Collector) sshd(running map[string]bool) *Software {
 		return nil
 	}
 	sw := &Software{Name: "sshd", Running: run, ConfigPath: "/etc/ssh/sshd_config", Version: c.version("ssh", "-V")}
+	hash := hashFiles(files, data)
 	if c.Run != nil { // effective config (includes defaults and includes); needs root
-		if out, err := c.Run("", "sshd", "-T"); err == nil {
+		if c.sshdConf != nil && c.sshdHash == hash {
+			sw.Settings = c.sshdConf // same files, same effective config: no need to fork sshd again
+		} else if out, err := c.Run("", "sshd", "-T"); err == nil {
 			sw.Settings = ParseSSHD(out)
+			c.sshdHash, c.sshdConf = hash, sw.Settings
 		}
 	}
 	if sw.Settings == nil {
@@ -293,7 +368,7 @@ func (c *Collector) sshd(running map[string]bool) *Software {
 		sort.SliceStable(files, func(i, j int) bool { return strings.Contains(files[i], ".d/") && !strings.Contains(files[j], ".d/") })
 		sw.Settings = ParseSSHD(strings.Join(data, "\n"))
 	}
-	sw.ConfigHash = hashFiles(files, data)
+	sw.ConfigHash = hash
 	return sw
 }
 

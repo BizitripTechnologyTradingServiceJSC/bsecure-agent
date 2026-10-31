@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -57,8 +58,26 @@ type Agent struct {
 	seen   map[string]time.Time
 	tails  []*logSource
 	outbox []result // command results not yet accepted by the panel (persisted)
-	events []Event
+	agg    *Aggregator
+	stats  SelfStats
+	// Log processing is capped at a fraction of one core: after a pass that took d, the next one waits d*(1/maxDuty-1).
+	nextCollect time.Time
+	lastFlush   time.Time
+	watcher     *Watcher
+	coll        *Collector // keeps its caches between inventories
+	invHash     [32]byte
+	invSent     time.Time
+	nftCount    countCache
 }
+
+// maxDuty is the share of one CPU core the log reader may use. Under a flood the reader sheds load (skips ahead
+// in the file, counts what it skipped) rather than burning more CPU or falling ever further behind.
+const (
+	maxDuty       = 0.10
+	passLines     = 20000
+	maxBacklog    = 8 << 20 // bytes still unread after a pass beyond which we skip ahead
+	hotFlushEvery = 2 * time.Second
+)
 
 func New(cfg Config, fw Firewall) (*Agent, error) {
 	g, err := ParseGuard(cfg.Allowlist)
@@ -76,7 +95,7 @@ func New(cfg Config, fw Firewall) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{cfg: cfg, fw: fw, cm: NewConfigManager(cfg.StateDir), guard: g, http: hc, seen: map[string]time.Time{}, tails: sources(cfg)}, nil
+	return &Agent{cfg: cfg, fw: fw, cm: NewConfigManager(cfg.StateDir), guard: g, http: hc, seen: map[string]time.Time{}, tails: sources(cfg), agg: NewAggregator()}, nil
 }
 
 func (a *Agent) do(method, path string, body, out any) error {
@@ -161,7 +180,8 @@ func (a *Agent) Heartbeat() error {
 	}
 	err := a.do("POST", "/agent/heartbeat", map[string]any{
 		"agentVersion": Version, "os": runtime.GOOS + "/" + runtime.GOARCH, "dryRun": a.cfg.DryRun, "allowConfig": a.cfg.AllowConfig,
-		"firewall": map[string]any{"backend": a.fw.Backend(), "ready": true, "blocked": a.fw.Count()},
+		"firewall": map[string]any{"backend": a.fw.Backend(), "ready": true, "blocked": a.nftCount.get(a.fw.Count)},
+		"stats":    a.stats.Sample(time.Now(), a.agg.Dropped, a.agg.Keys()),
 	}, &resp)
 	if err == nil && resp.NeverBlock != nil {
 		a.guard.AddNeverBlock(resp.NeverBlock)
@@ -172,55 +192,135 @@ func (a *Agent) Heartbeat() error {
 type logSource struct {
 	tail  *Tail
 	parse Parser
+	quick func(line []byte) bool // cheap prefilter; the parser only sees lines it lets through
 }
 
 func sources(cfg Config) []*logSource {
 	var out []*logSource
+	nq := &nginxQuick{}
 	for _, s := range []struct {
-		path string
-		p    Parser
-	}{{cfg.AuthLog, NewSSHParser().Parse}, {cfg.NginxLog, ParseNginxAccess}, {cfg.Syslog, ParseSyslog}} {
+		path  string
+		p     Parser
+		quick func([]byte) bool
+	}{{cfg.AuthLog, NewSSHParser().Parse, quickSSH}, {cfg.NginxLog, ParseNginxAccess, nq.Match}, {cfg.Syslog, ParseSyslog, quickSyslog}} {
 		if s.path != "" {
-			out = append(out, &logSource{&Tail{Path: s.path}, s.p})
+			out = append(out, &logSource{&Tail{Path: s.path}, s.p, s.quick})
 		}
 	}
 	return out
 }
 
-// CollectEvents reads new log lines from every configured source into the buffer.
-func (a *Agent) CollectEvents() {
+// CollectEvents reads new log lines from every configured source and folds the interesting ones into the
+// aggregator. force bypasses the CPU duty cap (used at startup and by the periodic safety poll).
+func (a *Agent) CollectEvents(force bool) {
+	start := time.Now()
+	if !force && start.Before(a.nextCollect) {
+		return
+	}
 	for _, src := range a.tails {
-		lines, err := src.tail.Read(20000) // busy nginx logs: keep up instead of falling behind forever
-		if err != nil {
-			continue
-		}
-		for _, l := range lines {
-			if e := src.parse(l, time.Now()); e != nil {
-				a.events = append(a.events, *e)
+		for pass := 0; pass < 4; pass++ {
+			now := time.Now()
+			backlog, err := src.tail.Each(passLines, func(b []byte) {
+				a.stats.Lines++
+				if n := len(b); n > 0 && b[n-1] == '\r' {
+					b = b[:n-1]
+				}
+				if !src.quick(b) {
+					return
+				}
+				if e := src.parse(string(b), now); e != nil {
+					a.agg.Add(*e, now)
+				}
+			})
+			if err != nil {
+				break
+			}
+			if backlog > maxBacklog {
+				skipped := src.tail.SkipToEnd()
+				a.agg.Dropped += int(skipped / 150) // ~150 bytes per line, an estimate for the "dropped" counter
+				log.Printf("log %s: %d MiB behind, skipped ahead (load shedding)", src.tail.Path, skipped>>20)
+				break
+			}
+			if backlog == 0 {
+				break
 			}
 		}
 	}
-	if len(a.events) > 5000 { // panel unreachable for a long time: keep the newest
-		a.events = a.events[len(a.events)-5000:]
+	d := time.Since(start)
+	a.nextCollect = time.Now().Add(time.Duration(float64(d) * (1/maxDuty - 1)))
+}
+
+// watchPaths are the log files worth waking up for.
+func (a *Agent) watchPaths() []string {
+	var ps []string
+	for _, s := range a.tails {
+		ps = append(ps, s.tail.Path)
 	}
+	return ps
 }
 
-// SendInventory reports ports, software versions and parsed settings (read-only facts).
+// SendInventory reports ports, software versions and parsed settings (read-only facts). An unchanged inventory is
+// not re-sent every 5 minutes: the panel only needs it again after invRefresh (it also serves as a liveness signal).
 func (a *Agent) SendInventory() error {
-	c := &Collector{Run: ExecRunner}
-	return a.do("POST", "/agent/inventory", c.Collect(), nil)
-}
-
-func (a *Agent) FlushEvents() error {
-	if len(a.events) == 0 {
+	if a.coll == nil {
+		a.coll = &Collector{Run: ExecRunner}
+	}
+	inv := a.coll.Collect()
+	stamp := inv.CollectedAt
+	inv.CollectedAt = ""
+	b, _ := json.Marshal(inv)
+	h := sha256.Sum256(b)
+	if h == a.invHash && time.Since(a.invSent) < invRefresh {
 		return nil
 	}
-	n := min(len(a.events), 500)
-	if err := a.do("POST", "/agent/events", map[string]any{"events": a.events[:n]}, nil); err != nil {
+	inv.CollectedAt = stamp
+	if err := a.do("POST", "/agent/inventory", inv, nil); err != nil {
 		return err
 	}
-	a.events = a.events[n:]
+	a.invHash, a.invSent = h, time.Now()
 	return nil
+}
+
+const invRefresh = 30 * time.Minute
+
+// FlushEvents uploads the unsent counters. On failure they go back into the aggregator and are retried with the
+// next flush (their minute stays the key, so nothing is double-counted).
+func (a *Agent) FlushEvents() error {
+	now := time.Now()
+	a.lastFlush = now
+	rs, rare := a.agg.Drain(now)
+	for i := 0; i < len(rs); i += maxPerRequest {
+		chunk := rs[i:min(i+maxPerRequest, len(rs))]
+		if err := a.do("POST", "/agent/rollups", map[string]any{"rollups": chunk}, nil); err != nil {
+			var he *httpError
+			if errors.As(err, &he) && he.code >= 400 && he.code < 500 && he.code != 429 {
+				for _, r := range chunk { // the panel will never accept these rows: drop them instead of retrying forever
+					a.agg.Dropped += r.N
+				}
+				log.Printf("rollups refused, dropped: %v", err)
+				continue
+			}
+			a.agg.Requeue(rs[i:], rare, now)
+			return err
+		}
+	}
+	for i := 0; i < len(rare); i += 500 {
+		chunk := rare[i:min(i+500, len(rare))]
+		if err := a.do("POST", "/agent/events", map[string]any{"events": chunk}, nil); err != nil {
+			a.agg.Requeue(nil, rare[i:], now)
+			return err
+		}
+	}
+	return nil
+}
+
+// flushIfHot sends early when a key piled up enough attempts that waiting for the next tick would delay noticing an attack.
+func (a *Agent) flushIfHot() {
+	if a.agg.Hot() && time.Since(a.lastFlush) >= hotFlushEvery {
+		if err := a.FlushEvents(); err != nil {
+			log.Printf("events: %v", err)
+		}
+	}
 }
 
 type httpError struct {
@@ -304,6 +404,7 @@ func (a *Agent) Execute(payload, sig string) (string, string) {
 		} else {
 			out, err = a.fw.Unblock(ip)
 		}
+		a.nftCount.Invalidate()
 	case "set_config":
 		if !a.cfg.AllowConfig {
 			return "rejected", "config changes are disabled on this agent (set ALLOW_CONFIG_CHANGES=true)"
@@ -404,8 +505,15 @@ func (a *Agent) Run() error {
 	hb, ev, cm, inv := time.NewTicker(30*time.Second), time.NewTicker(10*time.Second), time.NewTicker(5*time.Second), time.NewTicker(5*time.Minute)
 	a.loadOutbox()
 	a.loadSeen()
-	a.CollectEvents() // position every log tail now, so lines written before the first tick are not skipped
-	a.RevertDue()     // changes left unconfirmed across an agent restart
+	a.CollectEvents(true) // position every log tail now, so lines written before the first tick are not skipped
+	var wake <-chan struct{}
+	if w, err := NewWatcher(a.watchPaths(), 200*time.Millisecond); err == nil {
+		a.watcher, wake = w, w.Wake
+		defer w.Close()
+	} else {
+		log.Printf("file watching unavailable, polling every 10s: %v", err)
+	}
+	a.RevertDue() // changes left unconfirmed across an agent restart
 	_ = a.Heartbeat()
 	if err := a.SendInventory(); err != nil {
 		log.Printf("inventory: %v", err)
@@ -420,13 +528,20 @@ func (a *Agent) Run() error {
 			if err := a.SendInventory(); err != nil {
 				log.Printf("inventory: %v", err)
 			}
-		case <-ev.C:
-			a.CollectEvents()
+		case <-wake: // a log file changed (coalesced to ~5 wakeups/s at most)
+			a.CollectEvents(false)
+			a.flushIfHot()
+		case <-ev.C: // safety poll (rotation, missed wakeups) and regular upload
+			a.CollectEvents(true)
+			if a.watcher != nil {
+				a.watcher.Arm(a.watchPaths())
+			}
 			if err := a.FlushEvents(); err != nil {
 				log.Printf("events: %v", err)
 			}
 		case <-cm.C:
 			a.RevertDue() // before polling: a revert must not wait on the network
+			a.flushIfHot()
 			a.FlushOutbox()
 			if err := a.PollCommands(); err != nil {
 				log.Printf("commands: %v", err)
