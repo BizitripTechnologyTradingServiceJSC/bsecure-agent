@@ -102,8 +102,10 @@ func Verify(pub ed25519.PublicKey, serverID, payload, sigB64 string, now time.Ti
 
 // Guard holds local safety rules that the panel cannot override.
 type Guard struct {
-	Allow []netip.Prefix // admin IPs/CIDRs that are never blocked
-	extra []netip.Prefix // additional never-block ranges pushed by the panel (e.g. refreshed Cloudflare list)
+	// Overlay (VPN) ranges such as NetBird's 100.64.0.0/10: never blocked, or a block could cut the link that carries commands.
+	Overlay []netip.Prefix
+	Allow   []netip.Prefix // admin IPs/CIDRs that are never blocked
+	extra   []netip.Prefix // additional never-block ranges pushed by the panel (e.g. refreshed Cloudflare list)
 }
 
 // AddNeverBlock replaces the panel-provided never-block ranges. It can only make the guard stricter.
@@ -156,6 +158,11 @@ func (g *Guard) CheckIP(ip netip.Addr) error {
 	for _, p := range append(cloudflare[:len(cloudflare):len(cloudflare)], g.extra...) {
 		if p.Contains(ip) {
 			return errors.New("refusing Cloudflare edge address: block it at Cloudflare instead")
+		}
+	}
+	for _, p := range g.Overlay {
+		if p.Contains(ip) {
+			return errors.New("refusing VPN overlay address: blocking a peer could cut the management link")
 		}
 	}
 	for _, p := range g.Allow {

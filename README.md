@@ -51,6 +51,8 @@ Reload dùng `systemctl`; trên máy không có systemd (container, OpenRC) thì
 | `DRY_RUN` | `true` | |
 | `ALLOW_CONFIG_CHANGES` | `false` | |
 | `ALLOW_INSECURE_HTTP` | `false` | chỉ để thử |
+| `PANEL_ALLOWED_CIDRS` | trống | Chạy qua VPN: chỉ kết nối nếu địa chỉ panel nằm trong các dải này, ví dụ `100.64.0.0/10` (NetBird). Tên panel phân giải ra địa chỉ ngoài dải thì agent từ chối |
+| `OVERLAY_CIDRS` | `100.64.0.0/10` | Dải VPN không bao giờ bị chặn (đổi nếu NetBird dùng dải khác) |
 
 systemd: `deploy/fwagent.service`. Test: `go test ./...`; kiểm thử đầu cuối bằng Docker: `lab/e2e.sh` trong bsecure-cp.
 

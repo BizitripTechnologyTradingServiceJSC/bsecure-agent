@@ -24,6 +24,16 @@ func envOpt(k, d string) string {
 	return d
 }
 
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func main() {
 	host, _ := os.Hostname()
 	cfg := agent.Config{
@@ -42,7 +52,9 @@ func main() {
 	if cfg.PanelURL == "" {
 		log.Fatal("PANEL_URL is required")
 	}
-	cfg.TLS = agent.TLSConfig{CAFile: env("PANEL_CA_FILE", ""), CertFile: env("AGENT_CERT_FILE", ""), KeyFile: env("AGENT_KEY_FILE", "")}
+	cfg.TLS = agent.TLSConfig{CAFile: env("PANEL_CA_FILE", ""), CertFile: env("AGENT_CERT_FILE", ""), KeyFile: env("AGENT_KEY_FILE", ""),
+		AllowedCIDRs: splitList(env("PANEL_ALLOWED_CIDRS", ""))}
+	cfg.OverlayCIDRs = splitList(env("OVERLAY_CIDRS", "100.64.0.0/10"))
 	cfg.AllowInsecure = env("ALLOW_INSECURE_HTTP", "false") == "true"
 	if cfg.AllowInsecure && !strings.HasPrefix(cfg.PanelURL, "https://") {
 		log.Printf("WARNING: PANEL_URL is not https; agent token and commands travel in clear text")

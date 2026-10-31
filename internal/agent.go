@@ -35,7 +35,8 @@ type Config struct {
 	AllowConfig   bool // opt-in: allow signed set_config commands to edit sshd/nginx/tinyproxy config
 	PanelPubKey   string
 	TLS           TLSConfig
-	AllowInsecure bool // permit http:// PANEL_URL (testing only) // base64 raw ed25519; pinned out-of-band, overrides what enroll returns
+	OverlayCIDRs  []string // VPN ranges that are never blocked (NetBird default 100.64.0.0/10)
+	AllowInsecure bool     // permit http:// PANEL_URL (testing only) // base64 raw ed25519; pinned out-of-band, overrides what enroll returns
 }
 
 type state struct {
@@ -63,6 +64,13 @@ func New(cfg Config, fw Firewall) (*Agent, error) {
 	g, err := ParseGuard(cfg.Allowlist)
 	if err != nil {
 		return nil, err
+	}
+	for _, c := range cfg.OverlayCIDRs {
+		p, err := netip.ParsePrefix(strings.TrimSpace(c))
+		if err != nil {
+			return nil, fmt.Errorf("bad OVERLAY_CIDRS entry %q", c)
+		}
+		g.Overlay = append(g.Overlay, p.Masked())
 	}
 	hc, err := NewHTTPClient(cfg.PanelURL, cfg.TLS, cfg.AllowInsecure)
 	if err != nil {

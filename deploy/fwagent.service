@@ -1,6 +1,6 @@
 [Unit]
 Description=bsecure agent
-After=network-online.target
+After=network-online.target netbird.service
 Wants=network-online.target
 
 [Service]
