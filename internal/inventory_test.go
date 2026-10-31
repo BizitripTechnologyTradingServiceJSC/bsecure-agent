@@ -95,3 +95,97 @@ func TestEmptyInventoryMarshalsArrays(t *testing.T) {
 		t.Fatalf("nil slices would serialise as null: %s", b)
 	}
 }
+
+func TestSSHParserCountsAttemptsNotLines(t *testing.T) {
+	p, now := NewSSHParser(), time.Now()
+	n := 0
+	feed := func(lines ...string) {
+		for _, l := range lines {
+			if p.Parse(l, now) != nil {
+				n++
+			}
+		}
+	}
+	// invalid user with 3 password tries, then the close line: 3 attempts
+	feed("sshd[1]: Invalid user admin from 203.0.113.9 port 4000",
+		"sshd[1]: Failed password for invalid user admin from 203.0.113.9 port 4000 ssh2",
+		"sshd[1]: Failed password for invalid user admin from 203.0.113.9 port 4000 ssh2",
+		"sshd[1]: Failed password for invalid user admin from 203.0.113.9 port 4000 ssh2",
+		"sshd[1]: Connection closed by invalid user admin 203.0.113.9 port 4000 [preauth]")
+	if n != 3 {
+		t.Fatalf("got %d, want 3", n)
+	}
+	// key-only scanner: no Failed line at all, still counted once
+	n = 0
+	feed("sshd[2]: Connection closed by authenticating user root 198.51.100.4 port 5000 [preauth]")
+	feed("sshd[3]: Invalid user test from 198.51.100.4 port 5001", "sshd[3]: Disconnected from invalid user test 198.51.100.4 port 5001 [preauth]")
+	feed("sshd[5]: Disconnected from invalid user oracle 198.51.100.9 port 7000 [preauth]")
+	if n != 3 {
+		t.Fatalf("got %d, want 3", n)
+	}
+	// existing user, 2 failures on one connection
+	n = 0
+	feed("sshd[4]: Failed password for root from 192.0.2.7 port 6000 ssh2", "sshd[4]: Failed password for root from 192.0.2.7 port 6000 ssh2")
+	if n != 2 {
+		t.Fatalf("got %d, want 2", n)
+	}
+}
+
+func TestPortOwnerByUIDWhenFdUnreadable(t *testing.T) {
+	root := t.TempDir()
+	// socket owned by uid 105, no readable fd link (as without CAP_SYS_PTRACE)
+	write(t, root, "/proc/net/tcp", "h\n 0: 00000000:22B8 00000000:0000 0A 0:0 0:0 0 105 0 777 1\n 1: 00000000:1F90 00000000:0000 0A 0:0 0:0 0 106 0 778 1\n")
+	write(t, root, "/proc/50/comm", "tinyproxy\n")
+	write(t, root, "/proc/50/status", "Name:\ttinyproxy\nUid:\t105\t105\t105\t105\n")
+	write(t, root, "/proc/51/comm", "tinyproxy\n")
+	write(t, root, "/proc/51/status", "Name:\ttinyproxy\nUid:\t105\t105\t105\t105\n")
+	write(t, root, "/proc/60/comm", "app-a\n")
+	write(t, root, "/proc/60/status", "Uid:\t106\t106\t106\t106\n")
+	write(t, root, "/proc/61/comm", "app-b\n")
+	write(t, root, "/proc/61/status", "Uid:\t106\t106\t106\t106\n")
+	ports := (&Collector{Root: root}).ListeningPorts()
+	if len(ports) != 2 || ports[0].Port != 8080 || ports[0].Process != "" || ports[1].Port != 8888 || ports[1].Process != "tinyproxy" {
+		t.Fatalf("%+v", ports) // uid 106 is ambiguous: no guess
+	}
+}
+
+func TestInventoryDoesNotForkAgainWhenNothingChanged(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "/etc/ssh/sshd_config", "PermitRootLogin no\n")
+	runs := map[string]int{}
+	c := &Collector{Root: root, Run: func(_ string, name string, args ...string) (string, error) {
+		runs[name]++
+		return "OpenSSH_9.6p1\nPermitRootLogin no\n", nil
+	}}
+	c.Collect()
+	c.Collect()
+	c.Collect()
+	if runs["sshd"] != 1 || runs["ssh"] != 1 {
+		t.Fatalf("external programs ran again: %v", runs)
+	}
+	write(t, root, "/etc/ssh/sshd_config", "PermitRootLogin yes\n") // config changed: effective config must be re-read
+	c.Collect()
+	if runs["sshd"] != 2 {
+		t.Fatalf("changed config not re-read: %v", runs)
+	}
+}
+
+func TestSocketOwnerWalkOnlyForNewListeners(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "/proc/net/tcp", "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4242 1 0 100 0 0 10 0\n")
+	write(t, root, "/proc/7/comm", "nginx\n")
+	if err := os.MkdirAll(root+"/proc/7/fd", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("socket:[4242]", root+"/proc/7/fd/3"); err != nil {
+		t.Fatal(err)
+	}
+	c := &Collector{Root: root}
+	if p := c.ListeningPorts(); len(p) != 1 || p[0].PID != 7 {
+		t.Fatalf("%+v", p)
+	}
+	os.Remove(root + "/proc/7/fd/3") // a second inventory must be served from the cache without walking fds
+	if p := c.ListeningPorts(); len(p) != 1 || p[0].PID != 7 {
+		t.Fatalf("cache not used: %+v", p)
+	}
+}

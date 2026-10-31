@@ -1,20 +1,37 @@
 [Unit]
-Description=Firewall platform agent
-After=network-online.target
+Description=bsecure agent
+After=network-online.target netbird.service
+Wants=network-online.target
 
 [Service]
-EnvironmentFile=/etc/fwagent.env
+EnvironmentFile=/etc/fwagent/agent.env
 ExecStart=/usr/local/bin/fwagent
 Restart=always
+RestartSec=5
 User=root
-# Agent only needs nft; drop everything else.
-CapabilityBoundingSet=CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN
+# NET_ADMIN: nftables. DAC_READ_SEARCH: read /var/log/auth.log, nginx logs and users' authorized_keys (root without
+# this capability cannot read files owned by syslog/www-data or mode 0600). SYS_PTRACE: map listening sockets to
+# the processes of other users (/proc/<pid>/fd).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+AmbientCapabilities=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/fwagent
-ProtectHome=true
+ProtectHome=read-only
 PrivateTmp=true
+StateDirectory=fwagent
+StateDirectoryMode=0700
+
+# The agent must never be the reason a server is slow. Soft limits first, hard ones as a backstop.
+Nice=10
+CPUWeight=20
+CPUQuota=15%
+MemoryHigh=96M
+MemoryMax=160M
+TasksMax=64
+LimitNOFILE=1024
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=multi-user.target

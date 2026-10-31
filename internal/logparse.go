@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"net/netip"
 	"regexp"
 	"strings"
@@ -69,4 +70,53 @@ func ParseSyslog(line string, now time.Time) *Event {
 		return nil
 	}
 	return &Event{TS: now.UTC().Format(time.RFC3339), Source: "syslog", Type: typ, Line: clip(secretRe.ReplaceAllString(line, "$1=<redacted>"), 300)}
+}
+
+// The quick* functions are allocation-free filters run on every raw log line before the (much slower) parsers.
+// They may let uninteresting lines through, but must never reject a line its parser would accept; tests check that.
+var (
+	sshNeedles    = [][]byte{[]byte("Failed "), []byte("Invalid user"), []byte("[preauth]")}
+	syslogNeedles = [][]byte{[]byte("sudo"), []byte("Out of memory"), []byte("useradd"), []byte("segfault")}
+	nginxNeedles  = [][]byte{[]byte("/.env"), []byte("/.git/"), []byte("wp-login.php"), []byte("xmlrpc.php"), []byte("phpmyadmin"), []byte("/vendor/phpunit"),
+		[]byte("/cgi-bin/"), []byte("/actuator"), []byte("/boaform"), []byte("/.aws"), []byte("/etc/passwd"), []byte("../"), []byte("%2e%2e"),
+		[]byte("union%20select"), []byte("union+select"), []byte("<script"), []byte("%3cscript"), []byte("/shell.php"), []byte("/eval-stdin.php")}
+	nginx401 = []byte(`" 401 `)
+)
+
+func anyContains(b []byte, needles [][]byte) bool {
+	for _, n := range needles {
+		if bytes.Contains(b, n) {
+			return true
+		}
+	}
+	return false
+}
+
+func quickSSH(b []byte) bool    { return anyContains(b, sshNeedles) }
+func quickSyslog(b []byte) bool { return anyContains(b, syslogNeedles) }
+
+// nginxQuick looks only at the request ("GET /path HTTP/1.1"), which is all the scanner patterns match on, and
+// lowercases that short span into a scratch buffer because the patterns are case-insensitive.
+type nginxQuick struct{ buf []byte }
+
+func (q *nginxQuick) Match(b []byte) bool {
+	i := bytes.IndexByte(b, '"')
+	if i < 0 {
+		return false
+	}
+	j := bytes.IndexByte(b[i+1:], '"')
+	if j < 0 {
+		return false
+	}
+	req := b[i+1 : i+1+j]
+	if bytes.HasPrefix(b[i+1+j:], nginx401) {
+		return true
+	}
+	q.buf = append(q.buf[:0], req...)
+	for k, c := range q.buf {
+		if c >= 'A' && c <= 'Z' {
+			q.buf[k] = c + 32
+		}
+	}
+	return anyContains(q.buf, nginxNeedles)
 }
